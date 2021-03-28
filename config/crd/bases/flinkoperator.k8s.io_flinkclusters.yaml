@@ -1,10 +1,10 @@
 
 ---
-apiVersion: apiextensions.k8s.io/v1beta1
+apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
   annotations:
-    controller-gen.kubebuilder.io/version: v0.3.0
+    controller-gen.kubebuilder.io/version: v0.5.0
   creationTimestamp: null
   name: flinkclusters.flinkoperator.k8s.io
 spec:
@@ -15,42 +15,42 @@ spec:
     plural: flinkclusters
     singular: flinkcluster
   scope: Namespaced
-  subresources:
-    status: {}
-  validation:
-    openAPIV3Schema:
-      properties:
-        apiVersion:
-          type: string
-        kind:
-          type: string
-        metadata:
-          type: object
-        spec:
-          properties:
-            batchSchedulerName:
-              type: string
-            envFrom:
-              items:
-                properties:
-                  configMapRef:
-                    properties:
-                      name:
-                        type: string
-                      optional:
-                        type: boolean
-                    type: object
-                  prefix:
-                    type: string
-                  secretRef:
-                    properties:
-                      name:
-                        type: string
-                      optional:
-                        type: boolean
-                    type: object
-                type: object
-              type: array
+  versions:
+  - name: v1beta1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              batchSchedulerName:
+                type: string
+              envFrom:
+                items:
+                  properties:
+                    configMapRef:
+                      properties:
+                        name:
+                          type: string
+                        optional:
+                          type: boolean
+                      type: object
+                    prefix:
+                      type: string
+                    secretRef:
+                      properties:
+                        name:
+                          type: string
+                        optional:
+                          type: boolean
+                      type: object
+                  type: object
+                type: array
             envVars:
               items:
                 properties:
@@ -5381,12 +5381,6 @@ spec:
                   type: object
                 job:
                   properties:
-                    deployTime:
-                      type: string
-                    endTime:
-                      type: string
-                    finalSavepoint:
-                      type: boolean
                     fromSavepoint:
                       type: string
                     id:
@@ -5401,11 +5395,23 @@ spec:
                       type: integer
                     savepointLocation:
                       type: string
+                    state:
+                      type: string
+                    endTime:
+                      type: string
+                    finalSavepoint:
+                      type: boolean
+                    deployTime:
+                      type: string
                     savepointTime:
                       type: string
                     startTime:
                       type: string
-                    state:
+                    lastSavepointTime:
+                      type: string
+                    lastSavepointTriggerID:
+                      type: string
+                    lastSavepointTriggerTime:
                       type: string
                   required:
                   - state
@@ -5482,6 +5488,8 @@ spec:
               - state
               - updateTime
               type: object
+            currentRevision:
+              type: string
             lastUpdateTime:
               type: string
             revision:
@@ -5522,11 +5530,8 @@ spec:
       required:
       - spec
       type: object
-  version: v1beta1
-  versions:
-  - name: v1beta1
-    served: true
-    storage: true
+  subresources:
+    status: {}
 status:
   acceptedNames:
     kind: ""
