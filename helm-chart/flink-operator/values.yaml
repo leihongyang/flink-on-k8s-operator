@@ -15,7 +15,7 @@ rbac:
 
 # The defination of the operator image
 operatorImage:
-  name:
+  name: "harbor.pinnettech.cn:8000/spark-operator/flink-operator:v1beta1-6"
   pullPolicy: IfNotPresent
 
 serviceAccount:

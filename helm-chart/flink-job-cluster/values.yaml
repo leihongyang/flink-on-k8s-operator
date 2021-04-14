@@ -2,7 +2,7 @@
 # Declare variables to be passed into your templates.
 
 image:
-  repository: flink
+  repository: harbor.pinnettech.cn:8000/spark-operator/flink
   tag: 1.9.3
 
 # Prometheus reporter jar to be loaded by flink
