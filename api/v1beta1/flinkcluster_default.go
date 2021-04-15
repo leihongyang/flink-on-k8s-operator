@@ -36,7 +36,7 @@ func _SetDefault(cluster *FlinkCluster) {
 
 func _SetImageDefault(imageSpec *ImageSpec) {
 	if len(imageSpec.PullPolicy) == 0 {
-		imageSpec.PullPolicy = corev1.PullAlways
+		imageSpec.PullPolicy = corev1.PullIfNotPresent
 	}
 }
 

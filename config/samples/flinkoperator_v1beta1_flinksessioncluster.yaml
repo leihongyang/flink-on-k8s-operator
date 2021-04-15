@@ -18,8 +18,8 @@ metadata:
   name: flinksessioncluster-sample
 spec:
   image:
-    name: flink:1.8.2
-    pullPolicy: Always
+    name: flink:1.9.3
+    pullPolicy: IfNotPresent
   jobManager:
     accessScope: Cluster
     securityContext:

@@ -45,4 +45,4 @@ spec:
       containers:
       - name: {{operator_name}}
         image: {{operator_image}}
-        imagePullPolicy: Always
+        imagePullPolicy: IfNotPresent

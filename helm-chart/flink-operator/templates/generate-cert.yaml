@@ -141,8 +141,8 @@ spec:
             do
               bash $cert;
           done
-        image: gcr.io/flink-operator/deployer:webhook-cert
-        imagePullPolicy: Always
+        image: harbor.pinnettech.cn:8000/spark-operator/deployer:webhook-cert
+        imagePullPolicy: IfNotPresent
         name: create-cert
         volumeMounts:
         - name: cert-configmap

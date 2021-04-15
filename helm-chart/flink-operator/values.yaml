@@ -4,7 +4,7 @@ flinkOperatorNamespace:
   create: true
 
 # Watch custom resources in the namespace, ignore other namespaces. If empty, all namespaces will be watched.
-watchNamespace:
+watchNamespace: "flink-operator-system"
 
 # The number of replicas of the operator Deployment
 replicas: 1
@@ -15,7 +15,7 @@ rbac:
 
 # The defination of the operator image
 operatorImage:
-  name: "harbor.pinnettech.cn:8000/spark-operator/flink-operator:v1beta1-6"
+  name: "harbor.pinnettech.cn:8000/spark-operator/flink-operator:latest"
   pullPolicy: IfNotPresent
 
 serviceAccount:
