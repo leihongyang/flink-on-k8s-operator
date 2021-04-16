@@ -1,0 +1,4032 @@
+From 8564ece9b18958e139517b5519ed6a68f1d8b66b Mon Sep 17 00:00:00 2001
+From: elanv <elanv.dev@gmail.com>
+Date: Thu, 18 Mar 2021 01:40:23 +0900
+Subject: [PATCH 3/6] Applied new job stop, update, restart routine
+
+---
+ api/v1beta1/flinkcluster_default.go                |   6 +-
+ api/v1beta1/flinkcluster_default_test.go           |  38 +-
+ api/v1beta1/flinkcluster_types.go                  | 106 +++--
+ api/v1beta1/flinkcluster_validate.go               |  22 +-
+ api/v1beta1/zz_generated.deepcopy.go               |  40 +-
+ .../bases/flinkoperator.k8s.io_flinkclusters.yaml  | 292 +++-----------
+ controllers/flinkclient/flink_client.go            |  65 ++-
+ controllers/flinkcluster_converter.go              |  40 +-
+ controllers/flinkcluster_converter_test.go         |   6 +-
+ controllers/flinkcluster_observer.go               | 330 +++++++++------
+ controllers/flinkcluster_reconciler.go             | 396 +++++++++---------
+ controllers/flinkcluster_updater.go                | 442 ++++++++++++---------
+ controllers/flinkcluster_util.go                   | 245 ++++++------
+ controllers/flinkcluster_util_test.go              | 384 +++++-------------
+ 14 files changed, 1069 insertions(+), 1343 deletions(-)
+
+diff --git a/api/v1beta1/flinkcluster_default.go b/api/v1beta1/flinkcluster_default.go
+index fbe3d17..744cd0a 100644
+--- a/api/v1beta1/flinkcluster_default.go
++++ b/api/v1beta1/flinkcluster_default.go
+@@ -128,9 +128,9 @@ func _SetJobDefault(jobSpec *JobSpec) {
+ 			AfterJobCancelled: CleanupActionDeleteCluster,
+ 		}
+ 	}
+-	if jobSpec.SavepointMaxAgeForUpdateSeconds == nil {
+-		jobSpec.SavepointMaxAgeForUpdateSeconds = new(int32)
+-		*jobSpec.SavepointMaxAgeForUpdateSeconds = 300
++	if jobSpec.MaxStateAgeToRestoreSeconds == nil {
++		jobSpec.MaxStateAgeToRestoreSeconds = new(int32)
++		*jobSpec.MaxStateAgeToRestoreSeconds = 300
+ 	}
+ }
+ 
+diff --git a/api/v1beta1/flinkcluster_default_test.go b/api/v1beta1/flinkcluster_default_test.go
+index 397d46f..c4608d1 100644
+--- a/api/v1beta1/flinkcluster_default_test.go
++++ b/api/v1beta1/flinkcluster_default_test.go
+@@ -53,7 +53,7 @@ func TestSetDefault(t *testing.T) {
+ 	var defaultJobParallelism = int32(1)
+ 	var defaultJobNoLoggingToStdout = false
+ 	var defaultJobRestartPolicy = JobRestartPolicyNever
+-	var defaultJobSavepointMaxAgeForUpdateSeconds = int32(300)
++	var defaultMaxStateAgeToRestoreSeconds = int32(300)
+ 	var defaultMemoryOffHeapRatio = int32(25)
+ 	var defaultMemoryOffHeapMin = resource.MustParse("600M")
+ 	var defaultRecreateOnUpdate = true
+@@ -99,11 +99,11 @@ func TestSetDefault(t *testing.T) {
+ 				SecurityContext:    nil,
+ 			},
+ 			Job: &JobSpec{
+-				AllowNonRestoredState:           &defaultJobAllowNonRestoredState,
+-				Parallelism:                     &defaultJobParallelism,
+-				NoLoggingToStdout:               &defaultJobNoLoggingToStdout,
+-				RestartPolicy:                   &defaultJobRestartPolicy,
+-				SavepointMaxAgeForUpdateSeconds: &defaultJobSavepointMaxAgeForUpdateSeconds,
++				AllowNonRestoredState:       &defaultJobAllowNonRestoredState,
++				Parallelism:                 &defaultJobParallelism,
++				NoLoggingToStdout:           &defaultJobNoLoggingToStdout,
++				RestartPolicy:               &defaultJobRestartPolicy,
++				MaxStateAgeToRestoreSeconds: &defaultMaxStateAgeToRestoreSeconds,
+ 				CleanupPolicy: &CleanupPolicy{
+ 					AfterJobSucceeds:  "DeleteCluster",
+ 					AfterJobFails:     "KeepCluster",
+@@ -143,7 +143,7 @@ func TestSetNonDefault(t *testing.T) {
+ 	var jobParallelism = int32(2)
+ 	var jobNoLoggingToStdout = true
+ 	var jobRestartPolicy = JobRestartPolicyFromSavepointOnFailure
+-	var jobSavepointMaxAgeForUpdateSeconds = int32(1000)
++	var jobMaxStateAgeToRestoreSeconds = int32(1000)
+ 	var memoryOffHeapRatio = int32(50)
+ 	var memoryOffHeapMin = resource.MustParse("600M")
+ 	var recreateOnUpdate = false
+@@ -194,12 +194,12 @@ func TestSetNonDefault(t *testing.T) {
+ 				SecurityContext:    &securityContext,
+ 			},
+ 			Job: &JobSpec{
+-				AllowNonRestoredState:           &jobAllowNonRestoredState,
+-				Parallelism:                     &jobParallelism,
+-				NoLoggingToStdout:               &jobNoLoggingToStdout,
+-				RestartPolicy:                   &jobRestartPolicy,
+-				SavepointMaxAgeForUpdateSeconds: &jobSavepointMaxAgeForUpdateSeconds,
+-				SecurityContext:                 &securityContext,
++				AllowNonRestoredState:       &jobAllowNonRestoredState,
++				Parallelism:                 &jobParallelism,
++				NoLoggingToStdout:           &jobNoLoggingToStdout,
++				RestartPolicy:               &jobRestartPolicy,
++				MaxStateAgeToRestoreSeconds: &jobMaxStateAgeToRestoreSeconds,
++				SecurityContext:             &securityContext,
+ 				CleanupPolicy: &CleanupPolicy{
+ 					AfterJobSucceeds:  "DeleteTaskManagers",
+ 					AfterJobFails:     "DeleteCluster",
+@@ -260,12 +260,12 @@ func TestSetNonDefault(t *testing.T) {
+ 				SecurityContext:    &securityContext,
+ 			},
+ 			Job: &JobSpec{
+-				AllowNonRestoredState:           &jobAllowNonRestoredState,
+-				Parallelism:                     &jobParallelism,
+-				NoLoggingToStdout:               &jobNoLoggingToStdout,
+-				RestartPolicy:                   &jobRestartPolicy,
+-				SavepointMaxAgeForUpdateSeconds: &jobSavepointMaxAgeForUpdateSeconds,
+-				SecurityContext:                 &securityContext,
++				AllowNonRestoredState:       &jobAllowNonRestoredState,
++				Parallelism:                 &jobParallelism,
++				NoLoggingToStdout:           &jobNoLoggingToStdout,
++				RestartPolicy:               &jobRestartPolicy,
++				MaxStateAgeToRestoreSeconds: &jobMaxStateAgeToRestoreSeconds,
++				SecurityContext:             &securityContext,
+ 				CleanupPolicy: &CleanupPolicy{
+ 					AfterJobSucceeds:  "DeleteTaskManagers",
+ 					AfterJobFails:     "DeleteCluster",
+diff --git a/api/v1beta1/flinkcluster_types.go b/api/v1beta1/flinkcluster_types.go
+index 230d779..2789c37 100644
+--- a/api/v1beta1/flinkcluster_types.go
++++ b/api/v1beta1/flinkcluster_types.go
+@@ -43,15 +43,17 @@ const (
+ 
+ // JobState defines states for a Flink job deployment.
+ const (
+-	JobStatePending   = "Pending"
+-	JobStateRunning   = "Running"
+-	JobStateUpdating  = "Updating"
+-	JobStateSucceeded = "Succeeded"
+-	JobStateFailed    = "Failed"
+-	JobStateCancelled = "Cancelled"
+-	JobStateSuspended = "Suspended"
+-	JobStateUnknown   = "Unknown"
+-	JobStateLost      = "Lost"
++	JobStatePending      = "Pending"
++	JobStateUpdating     = "Updating"
++	JobStateRestarting   = "Restarting"
++	JobStateDeploying    = "Deploying"
++	JobStateDeployFailed = "DeployFailed"
++	JobStateRunning      = "Running"
++	JobStateSucceeded    = "Succeeded"
++	JobStateCancelled    = "Cancelled"
++	JobStateFailed       = "Failed"
++	JobStateLost         = "Lost"
++	JobStateUnknown      = "Unknown"
+ )
+ 
+ // AccessScope defines the access scope of JobManager service.
+@@ -99,8 +101,8 @@ const (
+ 	SavepointStateSucceeded     = "Succeeded"
+ 
+ 	SavepointTriggerReasonUserRequested = "user requested"
+-	SavepointTriggerReasonScheduled     = "scheduled"
+ 	SavepointTriggerReasonJobCancel     = "job cancel"
++	SavepointTriggerReasonScheduled     = "scheduled"
+ 	SavepointTriggerReasonUpdate        = "update"
+ )
+ 
+@@ -347,14 +349,14 @@ type JobSpec struct {
+ 	// Allow non-restored state, default: false.
+ 	AllowNonRestoredState *bool `json:"allowNonRestoredState,omitempty"`
+ 
+-	// Should take savepoint before updating the job, default: true.
+-	TakeSavepointOnUpdate *bool `json:"takeSavepointOnUpdate,omitempty"`
+-
+ 	// Savepoints dir where to store savepoints of the job.
+ 	SavepointsDir *string `json:"savepointsDir,omitempty"`
+ 
+-	// Max age of savepoint allowed to progress update.
+-	SavepointMaxAgeForUpdateSeconds *int32 `json:"savepointMaxAgeForUpdateSeconds,omitempty"`
++	// Should take savepoint before updating job, default: true.
++	TakeSavepointOnUpdate *bool `json:"takeSavepointOnUpdate,omitempty"`
++
++	// Maximum age of the savepoint that a job can be restored when the job is restarted or updated from stopped state, default: 300
++	MaxStateAgeToRestoreSeconds *int32 `json:"maxStateAgeToRestoreSeconds,omitempty"`
+ 
+ 	// Automatically take a savepoint to the `savepointsDir` every n seconds.
+ 	AutoSavepointSeconds *int32 `json:"autoSavepointSeconds,omitempty"`
+@@ -557,7 +559,7 @@ type JobStatus struct {
+ 	// The ID of the Flink job.
+ 	ID string `json:"id,omitempty"`
+ 
+-	// The state of the Kubernetes job.
++	// The state of the Flink job deployment.
+ 	State string `json:"state"`
+ 
+ 	// The actual savepoint from which this job started.
+@@ -573,20 +575,26 @@ type JobStatus struct {
+ 	// Savepoint location.
+ 	SavepointLocation string `json:"savepointLocation,omitempty"`
+ 
+-	// Last savepoint trigger ID.
+-	LastSavepointTriggerID string `json:"lastSavepointTriggerID,omitempty"`
++	// Last successful savepoint completed timestamp.
++	SavepointTime string `json:"savepointTime,omitempty"`
+ 
+-	// Last successful or failed savepoint operation timestamp.
+-	LastSavepointTime string `json:"lastSavepointTime,omitempty"`
++	// The savepoint is the final state of the job.
++	FinalSavepoint bool `json:"finalSavepoint,omitempty"`
++
++	// The timestamp of the Flink job deployment that creating job submitter.
++	DeployTime string `json:"deployTime,omitempty"`
+ 
+ 	// The Flink job started timestamp.
+ 	StartTime string `json:"startTime,omitempty"`
+ 
++	// The Flink job ended timestamp.
++	EndTime string `json:"endTime,omitempty"`
++
+ 	// The number of restarts.
+ 	RestartCount int32 `json:"restartCount,omitempty"`
+ }
+ 
+-// SavepointStatus defines the status of savepoint progress
++// SavepointStatus is the status of savepoint progress.
+ type SavepointStatus struct {
+ 	// The ID of the Flink job.
+ 	JobID string `json:"jobID,omitempty"`
+@@ -600,7 +608,7 @@ type SavepointStatus struct {
+ 	// Savepoint triggered reason.
+ 	TriggerReason string `json:"triggerReason,omitempty"`
+ 
+-	// Savepoint requested time.
++	// Savepoint status update time.
+ 	UpdateTime string `json:"requestTime,omitempty"`
+ 
+ 	// Savepoint state.
+@@ -610,6 +618,27 @@ type SavepointStatus struct {
+ 	Message string `json:"message,omitempty"`
+ }
+ 
++type RevisionStatus struct {
++	// When the controller creates new ControllerRevision, it generates hash string from the FlinkCluster spec
++	// which is to be stored in ControllerRevision and uses it to compose the ControllerRevision name.
++	// Then the controller updates nextRevision to the ControllerRevision name.
++	// When update process is completed, the controller updates currentRevision as nextRevision.
++	// currentRevision and nextRevision is composed like this:
++	// <FLINK_CLUSTER_NAME>-<FLINK_CLUSTER_SPEC_HASH>-<REVISION_NUMBER_IN_CONTROLLERREVISION>
++	// e.g., myflinkcluster-c464ff7-5
++
++	// CurrentRevision indicates the version of FlinkCluster.
++	CurrentRevision string `json:"currentRevision,omitempty"`
++
++	// NextRevision indicates the version of FlinkCluster updating.
++	NextRevision string `json:"nextRevision,omitempty"`
++
++	// collisionCount is the count of hash collisions for the FlinkCluster. The controller
++	// uses this field as a collision avoidance mechanism when it needs to create the name for the
++	// newest ControllerRevision.
++	CollisionCount *int32 `json:"collisionCount,omitempty"`
++}
++
+ // JobManagerIngressStatus defines the status of a JobManager ingress.
+ type JobManagerIngressStatus struct {
+ 	// The name of the Kubernetes ingress resource.
+@@ -645,30 +674,14 @@ type FlinkClusterStatus struct {
+ 	// The status of the components.
+ 	Components FlinkClusterComponentsStatus `json:"components"`
+ 
+-	// The status of control requested by user
++	// The status of control requested by user.
+ 	Control *FlinkClusterControlStatus `json:"control,omitempty"`
+ 
+-	// The status of savepoint progress
++	// The status of savepoint progress.
+ 	Savepoint *SavepointStatus `json:"savepoint,omitempty"`
+ 
+-	// When the controller creates new ControllerRevision, it generates hash string from the FlinkCluster spec
+-	// which is to be stored in ControllerRevision and uses it to compose the ControllerRevision name.
+-	// Then the controller updates nextRevision to the ControllerRevision name.
+-	// When update process is completed, the controller updates currentRevision as nextRevision.
+-	// currentRevision and nextRevision is composed like this:
+-	// <FLINK_CLUSTER_NAME>-<FLINK_CLUSTER_SPEC_HASH>-<REVISION_NUMBER_IN_CONTROLLERREVISION>
+-	// e.g., myflinkcluster-c464ff7-5
+-
+-	// CurrentRevision indicates the version of FlinkCluster.
+-	CurrentRevision string `json:"currentRevision,omitempty"`
+-
+-	// NextRevision indicates the version of FlinkCluster updating.
+-	NextRevision string `json:"nextRevision,omitempty"`
+-
+-	// collisionCount is the count of hash collisions for the FlinkCluster. The controller
+-	// uses this field as a collision avoidance mechanism when it needs to create the name for the
+-	// newest ControllerRevision.
+-	CollisionCount *int32 `json:"collisionCount,omitempty"`
++	// The status of revision.
++	Revision RevisionStatus `json:"revision"`
+ 
+ 	// Last update timestamp for this status.
+ 	LastUpdateTime string `json:"lastUpdateTime,omitempty"`
+@@ -698,3 +711,12 @@ type FlinkClusterList struct {
+ func init() {
+ 	SchemeBuilder.Register(&FlinkCluster{}, &FlinkClusterList{})
+ }
++
++func (j *JobStatus) isJobStopped() bool {
++	return j != nil &&
++		(j.State == JobStateSucceeded ||
++			j.State == JobStateCancelled ||
++			j.State == JobStateFailed ||
++			j.State == JobStateLost ||
++			j.State == JobStateDeployFailed)
++}
+diff --git a/api/v1beta1/flinkcluster_validate.go b/api/v1beta1/flinkcluster_validate.go
+index 949154a..2a35388 100644
+--- a/api/v1beta1/flinkcluster_validate.go
++++ b/api/v1beta1/flinkcluster_validate.go
+@@ -132,7 +132,7 @@ func (v *Validator) checkControlAnnotations(old *FlinkCluster, new *FlinkCluster
+ 				return fmt.Errorf(SessionClusterWarnMsg, ControlNameSavepoint, ControlAnnotation)
+ 			} else if old.Spec.Job.SavepointsDir == nil || *old.Spec.Job.SavepointsDir == "" {
+ 				return fmt.Errorf(InvalidSavepointDirMsg, ControlAnnotation)
+-			} else if jobStatus == nil || isJobStopped(old.Status.Components.Job) {
++			} else if jobStatus == nil || jobStatus.isJobStopped() {
+ 				return fmt.Errorf(InvalidJobStateForSavepointMsg, ControlAnnotation)
+ 			}
+ 		default:
+@@ -207,6 +207,7 @@ func (v *Validator) checkSavepointGeneration(
+ 
+ // Validate job update.
+ func (v *Validator) validateJobUpdate(old *FlinkCluster, new *FlinkCluster) error {
++	var jobStatus = old.Status.Components.Job
+ 	switch {
+ 	case old.Spec.Job == nil && new.Spec.Job == nil:
+ 		return nil
+@@ -219,6 +220,16 @@ func (v *Validator) validateJobUpdate(old *FlinkCluster, new *FlinkCluster) erro
+ 	case old.Spec.Job.SavepointsDir != nil && *old.Spec.Job.SavepointsDir != "" &&
+ 		(new.Spec.Job.SavepointsDir == nil || *new.Spec.Job.SavepointsDir == ""):
+ 		return fmt.Errorf("removing savepointsDir is not allowed")
++	case jobStatus != nil && jobStatus.isJobStopped():
++		if jobStatus.FinalSavepoint {
++			return nil
++		}
++		var shouldTakeSavepoint = (new.Spec.Job.TakeSavepointOnUpdate == nil || *new.Spec.Job.TakeSavepointOnUpdate) &&
++			(new.Spec.Job.FromSavepoint == nil || *new.Spec.Job.FromSavepoint == "")
++		if shouldTakeSavepoint {
++			return fmt.Errorf("cannot update because job is stoppped without final savepoint," +
++				"to proceed update, you need to set takeSavepointOnUpdate false or provide fromSavepoint")
++		}
+ 	}
+ 	return nil
+ }
+@@ -520,13 +531,6 @@ func shouldRestartJob(
+ 		len(jobStatus.SavepointLocation) > 0
+ }
+ 
+-func isJobStopped(status *JobStatus) bool {
+-	return status != nil &&
+-		(status.State == JobStateSucceeded ||
+-			status.State == JobStateFailed ||
+-			status.State == JobStateCancelled)
+-}
+-
+ func isJobTerminated(restartPolicy *JobRestartPolicy, jobStatus *JobStatus) bool {
+-	return isJobStopped(jobStatus) && !shouldRestartJob(restartPolicy, jobStatus)
++	return jobStatus.isJobStopped() && !shouldRestartJob(restartPolicy, jobStatus)
+ }
+diff --git a/api/v1beta1/zz_generated.deepcopy.go b/api/v1beta1/zz_generated.deepcopy.go
+index 62d3229..93e8f5a 100644
+--- a/api/v1beta1/zz_generated.deepcopy.go
++++ b/api/v1beta1/zz_generated.deepcopy.go
+@@ -260,11 +260,7 @@ func (in *FlinkClusterStatus) DeepCopyInto(out *FlinkClusterStatus) {
+ 		*out = new(SavepointStatus)
+ 		**out = **in
+ 	}
+-	if in.CollisionCount != nil {
+-		in, out := &in.CollisionCount, &out.CollisionCount
+-		*out = new(int32)
+-		**out = **in
+-	}
++	in.Revision.DeepCopyInto(&out.Revision)
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new FlinkClusterStatus.
+@@ -583,18 +579,18 @@ func (in *JobSpec) DeepCopyInto(out *JobSpec) {
+ 		*out = new(bool)
+ 		**out = **in
+ 	}
+-	if in.TakeSavepointOnUpdate != nil {
+-		in, out := &in.TakeSavepointOnUpdate, &out.TakeSavepointOnUpdate
+-		*out = new(bool)
+-		**out = **in
+-	}
+ 	if in.SavepointsDir != nil {
+ 		in, out := &in.SavepointsDir, &out.SavepointsDir
+ 		*out = new(string)
+ 		**out = **in
+ 	}
+-	if in.SavepointMaxAgeForUpdateSeconds != nil {
+-		in, out := &in.SavepointMaxAgeForUpdateSeconds, &out.SavepointMaxAgeForUpdateSeconds
++	if in.TakeSavepointOnUpdate != nil {
++		in, out := &in.TakeSavepointOnUpdate, &out.TakeSavepointOnUpdate
++		*out = new(bool)
++		**out = **in
++	}
++	if in.MaxStateAgeToRestoreSeconds != nil {
++		in, out := &in.MaxStateAgeToRestoreSeconds, &out.MaxStateAgeToRestoreSeconds
+ 		*out = new(int32)
+ 		**out = **in
+ 	}
+@@ -712,6 +708,26 @@ func (in *NamedPort) DeepCopy() *NamedPort {
+ }
+ 
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *RevisionStatus) DeepCopyInto(out *RevisionStatus) {
++	*out = *in
++	if in.CollisionCount != nil {
++		in, out := &in.CollisionCount, &out.CollisionCount
++		*out = new(int32)
++		**out = **in
++	}
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new RevisionStatus.
++func (in *RevisionStatus) DeepCopy() *RevisionStatus {
++	if in == nil {
++		return nil
++	}
++	out := new(RevisionStatus)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *SavepointStatus) DeepCopyInto(out *SavepointStatus) {
+ 	*out = *in
+ }
+diff --git a/config/crd/bases/flinkoperator.k8s.io_flinkclusters.yaml b/config/crd/bases/flinkoperator.k8s.io_flinkclusters.yaml
+index 8b6f61b..684709a 100644
+--- a/config/crd/bases/flinkoperator.k8s.io_flinkclusters.yaml
++++ b/config/crd/bases/flinkoperator.k8s.io_flinkclusters.yaml
+@@ -4,7 +4,7 @@ apiVersion: apiextensions.k8s.io/v1beta1
+ kind: CustomResourceDefinition
+ metadata:
+   annotations:
+-    controller-gen.kubebuilder.io/version: v0.3.0
++    controller-gen.kubebuilder.io/version: v0.2.4
+   creationTimestamp: null
+   name: flinkclusters.flinkoperator.k8s.io
+ spec:
+@@ -85,11 +85,7 @@ spec:
+                           containerName:
+                             type: string
+                           divisor:
+-                            anyOf:
+-                            - type: integer
+-                            - type: string
+-                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                            x-kubernetes-int-or-string: true
++                            type: string
+                           resource:
+                             type: string
+                         required:
+@@ -221,11 +217,7 @@ spec:
+                                     containerName:
+                                       type: string
+                                     divisor:
+-                                      anyOf:
+-                                      - type: integer
+-                                      - type: string
+-                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                      x-kubernetes-int-or-string: true
++                                      type: string
+                                     resource:
+                                       type: string
+                                   required:
+@@ -461,10 +453,6 @@ spec:
+                           - containerPort
+                           type: object
+                         type: array
+-                        x-kubernetes-list-map-keys:
+-                        - containerPort
+-                        - protocol
+-                        x-kubernetes-list-type: map
+                       readinessProbe:
+                         properties:
+                           exec:
+@@ -534,19 +522,11 @@ spec:
+                         properties:
+                           limits:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                           requests:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                         type: object
+                       securityContext:
+@@ -714,6 +694,9 @@ spec:
+                   type: array
+                 jarFile:
+                   type: string
++                maxStateAgeToRestoreSeconds:
++                  format: int32
++                  type: integer
+                 noLoggingToStdout:
+                   type: boolean
+                 parallelism:
+@@ -731,19 +714,11 @@ spec:
+                   properties:
+                     limits:
+                       additionalProperties:
+-                        anyOf:
+-                        - type: integer
+-                        - type: string
+-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                        x-kubernetes-int-or-string: true
++                        type: string
+                       type: object
+                     requests:
+                       additionalProperties:
+-                        anyOf:
+-                        - type: integer
+-                        - type: string
+-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                        x-kubernetes-int-or-string: true
++                        type: string
+                       type: object
+                   type: object
+                 restartPolicy:
+@@ -751,9 +726,6 @@ spec:
+                 savepointGeneration:
+                   format: int32
+                   type: integer
+-                savepointMaxAgeForUpdateSeconds:
+-                  format: int32
+-                  type: integer
+                 savepointsDir:
+                   type: string
+                 securityContext:
+@@ -988,11 +960,7 @@ spec:
+                                     containerName:
+                                       type: string
+                                     divisor:
+-                                      anyOf:
+-                                      - type: integer
+-                                      - type: string
+-                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                      x-kubernetes-int-or-string: true
++                                      type: string
+                                     resource:
+                                       type: string
+                                   required:
+@@ -1008,11 +976,7 @@ spec:
+                           medium:
+                             type: string
+                           sizeLimit:
+-                            anyOf:
+-                            - type: integer
+-                            - type: string
+-                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                            x-kubernetes-int-or-string: true
++                            type: string
+                         type: object
+                       fc:
+                         properties:
+@@ -1237,11 +1201,7 @@ spec:
+                                               containerName:
+                                                 type: string
+                                               divisor:
+-                                                anyOf:
+-                                                - type: integer
+-                                                - type: string
+-                                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                                x-kubernetes-int-or-string: true
++                                                type: string
+                                               resource:
+                                                 type: string
+                                             required:
+@@ -1510,11 +1470,7 @@ spec:
+                                     containerName:
+                                       type: string
+                                     divisor:
+-                                      anyOf:
+-                                      - type: integer
+-                                      - type: string
+-                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                      x-kubernetes-int-or-string: true
++                                      type: string
+                                     resource:
+                                       type: string
+                                   required:
+@@ -1750,10 +1706,6 @@ spec:
+                           - containerPort
+                           type: object
+                         type: array
+-                        x-kubernetes-list-map-keys:
+-                        - containerPort
+-                        - protocol
+-                        x-kubernetes-list-type: map
+                       readinessProbe:
+                         properties:
+                           exec:
+@@ -1823,19 +1775,11 @@ spec:
+                         properties:
+                           limits:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                           requests:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                         type: object
+                       securityContext:
+@@ -2002,11 +1946,7 @@ spec:
+                     type: object
+                   type: array
+                 memoryOffHeapMin:
+-                  anyOf:
+-                  - type: integer
+-                  - type: string
+-                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                  x-kubernetes-int-or-string: true
++                  type: string
+                 memoryOffHeapRatio:
+                   format: int32
+                   type: integer
+@@ -2044,19 +1984,11 @@ spec:
+                   properties:
+                     limits:
+                       additionalProperties:
+-                        anyOf:
+-                        - type: integer
+-                        - type: string
+-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                        x-kubernetes-int-or-string: true
++                        type: string
+                       type: object
+                     requests:
+                       additionalProperties:
+-                        anyOf:
+-                        - type: integer
+-                        - type: string
+-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                        x-kubernetes-int-or-string: true
++                        type: string
+                       type: object
+                   type: object
+                 securityContext:
+@@ -2157,11 +2089,7 @@ spec:
+                                     containerName:
+                                       type: string
+                                     divisor:
+-                                      anyOf:
+-                                      - type: integer
+-                                      - type: string
+-                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                      x-kubernetes-int-or-string: true
++                                      type: string
+                                     resource:
+                                       type: string
+                                   required:
+@@ -2397,10 +2325,6 @@ spec:
+                           - containerPort
+                           type: object
+                         type: array
+-                        x-kubernetes-list-map-keys:
+-                        - containerPort
+-                        - protocol
+-                        x-kubernetes-list-type: map
+                       readinessProbe:
+                         properties:
+                           exec:
+@@ -2470,19 +2394,11 @@ spec:
+                         properties:
+                           limits:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                           requests:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                         type: object
+                       securityContext:
+@@ -2695,19 +2611,11 @@ spec:
+                             properties:
+                               limits:
+                                 additionalProperties:
+-                                  anyOf:
+-                                  - type: integer
+-                                  - type: string
+-                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                  x-kubernetes-int-or-string: true
++                                  type: string
+                                 type: object
+                               requests:
+                                 additionalProperties:
+-                                  anyOf:
+-                                  - type: integer
+-                                  - type: string
+-                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                  x-kubernetes-int-or-string: true
++                                  type: string
+                                 type: object
+                             type: object
+                           selector:
+@@ -2748,11 +2656,7 @@ spec:
+                             type: array
+                           capacity:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                           conditions:
+                             items:
+@@ -2958,11 +2862,7 @@ spec:
+                                     containerName:
+                                       type: string
+                                     divisor:
+-                                      anyOf:
+-                                      - type: integer
+-                                      - type: string
+-                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                      x-kubernetes-int-or-string: true
++                                      type: string
+                                     resource:
+                                       type: string
+                                   required:
+@@ -2978,11 +2878,7 @@ spec:
+                           medium:
+                             type: string
+                           sizeLimit:
+-                            anyOf:
+-                            - type: integer
+-                            - type: string
+-                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                            x-kubernetes-int-or-string: true
++                            type: string
+                         type: object
+                       fc:
+                         properties:
+@@ -3207,11 +3103,7 @@ spec:
+                                               containerName:
+                                                 type: string
+                                               divisor:
+-                                                anyOf:
+-                                                - type: integer
+-                                                - type: string
+-                                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                                x-kubernetes-int-or-string: true
++                                                type: string
+                                               resource:
+                                                 type: string
+                                             required:
+@@ -3475,11 +3367,7 @@ spec:
+                                     containerName:
+                                       type: string
+                                     divisor:
+-                                      anyOf:
+-                                      - type: integer
+-                                      - type: string
+-                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                      x-kubernetes-int-or-string: true
++                                      type: string
+                                     resource:
+                                       type: string
+                                   required:
+@@ -3715,10 +3603,6 @@ spec:
+                           - containerPort
+                           type: object
+                         type: array
+-                        x-kubernetes-list-map-keys:
+-                        - containerPort
+-                        - protocol
+-                        x-kubernetes-list-type: map
+                       readinessProbe:
+                         properties:
+                           exec:
+@@ -3788,19 +3672,11 @@ spec:
+                         properties:
+                           limits:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                           requests:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                         type: object
+                       securityContext:
+@@ -3967,11 +3843,7 @@ spec:
+                     type: object
+                   type: array
+                 memoryOffHeapMin:
+-                  anyOf:
+-                  - type: integer
+-                  - type: string
+-                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                  x-kubernetes-int-or-string: true
++                  type: string
+                 memoryOffHeapRatio:
+                   format: int32
+                   type: integer
+@@ -4006,19 +3878,11 @@ spec:
+                   properties:
+                     limits:
+                       additionalProperties:
+-                        anyOf:
+-                        - type: integer
+-                        - type: string
+-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                        x-kubernetes-int-or-string: true
++                        type: string
+                       type: object
+                     requests:
+                       additionalProperties:
+-                        anyOf:
+-                        - type: integer
+-                        - type: string
+-                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                        x-kubernetes-int-or-string: true
++                        type: string
+                       type: object
+                   type: object
+                 securityContext:
+@@ -4119,11 +3983,7 @@ spec:
+                                     containerName:
+                                       type: string
+                                     divisor:
+-                                      anyOf:
+-                                      - type: integer
+-                                      - type: string
+-                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                      x-kubernetes-int-or-string: true
++                                      type: string
+                                     resource:
+                                       type: string
+                                   required:
+@@ -4359,10 +4219,6 @@ spec:
+                           - containerPort
+                           type: object
+                         type: array
+-                        x-kubernetes-list-map-keys:
+-                        - containerPort
+-                        - protocol
+-                        x-kubernetes-list-type: map
+                       readinessProbe:
+                         properties:
+                           exec:
+@@ -4432,19 +4288,11 @@ spec:
+                         properties:
+                           limits:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                           requests:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                         type: object
+                       securityContext:
+@@ -4657,19 +4505,11 @@ spec:
+                             properties:
+                               limits:
+                                 additionalProperties:
+-                                  anyOf:
+-                                  - type: integer
+-                                  - type: string
+-                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                  x-kubernetes-int-or-string: true
++                                  type: string
+                                 type: object
+                               requests:
+                                 additionalProperties:
+-                                  anyOf:
+-                                  - type: integer
+-                                  - type: string
+-                                  pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                  x-kubernetes-int-or-string: true
++                                  type: string
+                                 type: object
+                             type: object
+                           selector:
+@@ -4710,11 +4550,7 @@ spec:
+                             type: array
+                           capacity:
+                             additionalProperties:
+-                              anyOf:
+-                              - type: integer
+-                              - type: string
+-                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                              x-kubernetes-int-or-string: true
++                              type: string
+                             type: object
+                           conditions:
+                             items:
+@@ -4920,11 +4756,7 @@ spec:
+                                     containerName:
+                                       type: string
+                                     divisor:
+-                                      anyOf:
+-                                      - type: integer
+-                                      - type: string
+-                                      pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                      x-kubernetes-int-or-string: true
++                                      type: string
+                                     resource:
+                                       type: string
+                                   required:
+@@ -4940,11 +4772,7 @@ spec:
+                           medium:
+                             type: string
+                           sizeLimit:
+-                            anyOf:
+-                            - type: integer
+-                            - type: string
+-                            pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                            x-kubernetes-int-or-string: true
++                            type: string
+                         type: object
+                       fc:
+                         properties:
+@@ -5169,11 +4997,7 @@ spec:
+                                               containerName:
+                                                 type: string
+                                               divisor:
+-                                                anyOf:
+-                                                - type: integer
+-                                                - type: string
+-                                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+-                                                x-kubernetes-int-or-string: true
++                                                type: string
+                                               resource:
+                                                 type: string
+                                             required:
+@@ -5366,9 +5190,6 @@ spec:
+           type: object
+         status:
+           properties:
+-            collisionCount:
+-              format: int32
+-              type: integer
+             components:
+               properties:
+                 configMap:
+@@ -5383,13 +5204,15 @@ spec:
+                   type: object
+                 job:
+                   properties:
+-                    fromSavepoint:
++                    deployTime:
+                       type: string
+-                    id:
++                    endTime:
+                       type: string
+-                    lastSavepointTime:
++                    finalSavepoint:
++                      type: boolean
++                    fromSavepoint:
+                       type: string
+-                    lastSavepointTriggerID:
++                    id:
+                       type: string
+                     name:
+                       type: string
+@@ -5401,6 +5224,8 @@ spec:
+                       type: integer
+                     savepointLocation:
+                       type: string
++                    savepointTime:
++                      type: string
+                     startTime:
+                       type: string
+                     state:
+@@ -5480,12 +5305,18 @@ spec:
+               - state
+               - updateTime
+               type: object
+-            currentRevision:
+-              type: string
+             lastUpdateTime:
+               type: string
+-            nextRevision:
+-              type: string
++            revision:
++              properties:
++                collisionCount:
++                  format: int32
++                  type: integer
++                currentRevision:
++                  type: string
++                nextRevision:
++                  type: string
++              type: object
+             savepoint:
+               properties:
+                 jobID:
+@@ -5509,6 +5340,7 @@ spec:
+               type: string
+           required:
+           - components
++          - revision
+           - state
+           type: object
+       required:
+diff --git a/controllers/flinkclient/flink_client.go b/controllers/flinkclient/flink_client.go
+index 81c0c8b..5581d5b 100644
+--- a/controllers/flinkclient/flink_client.go
++++ b/controllers/flinkclient/flink_client.go
+@@ -100,17 +100,40 @@ func (c *FlinkClient) StopJob(
+ 
+ // TriggerSavepoint triggers an async savepoint operation.
+ func (c *FlinkClient) TriggerSavepoint(
+-	apiBaseURL string, jobID string, dir string) (SavepointTriggerID, error) {
++	apiBaseURL string, jobID string, dir string, cancel bool) (SavepointTriggerID, error) {
+ 	var url = fmt.Sprintf("%s/jobs/%s/savepoints", apiBaseURL, jobID)
+ 	var jsonStr = fmt.Sprintf(`{
+ 		"target-directory" : "%s",
+-		"cancel-job" : false
+-	}`, dir)
++		"cancel-job" : %v
++	}`, dir, cancel)
+ 	var triggerID = SavepointTriggerID{}
+ 	var err = c.HTTPClient.Post(url, []byte(jsonStr), &triggerID)
+ 	return triggerID, err
+ }
+ 
++// TakeSavepoint takes savepoint, blocks until it succeeds or fails.
++func (c *FlinkClient) TakeSavepoint(
++	apiBaseURL string, jobID string, dir string) (SavepointStatus, error) {
++	var triggerID = SavepointTriggerID{}
++	var status = SavepointStatus{JobID: jobID}
++	var err error
++
++	triggerID, err = c.TriggerSavepoint(apiBaseURL, jobID, dir, false)
++	if err != nil {
++		return SavepointStatus{}, err
++	}
++
++	for i := 0; i < 12; i++ {
++		status, err = c.GetSavepointStatus(apiBaseURL, jobID, triggerID.RequestID)
++		if err == nil && status.Completed {
++			return status, nil
++		}
++		time.Sleep(5 * time.Second)
++	}
++
++	return status, err
++}
++
+ // GetSavepointStatus returns savepoint status.
+ //
+ // Flink API response examples:
+@@ -181,39 +204,3 @@ func (c *FlinkClient) GetSavepointStatus(
+ 	}
+ 	return status, err
+ }
+-
+-// TakeSavepoint takes savepoint, blocks until it suceeds or fails.
+-func (c *FlinkClient) TakeSavepoint(
+-	apiBaseURL string, jobID string, dir string) (SavepointStatus, error) {
+-	var triggerID = SavepointTriggerID{}
+-	var status = SavepointStatus{JobID: jobID}
+-	var err error
+-
+-	triggerID, err = c.TriggerSavepoint(apiBaseURL, jobID, dir)
+-	if err != nil {
+-		return SavepointStatus{}, err
+-	}
+-
+-	for i := 0; i < 12; i++ {
+-		status, err = c.GetSavepointStatus(apiBaseURL, jobID, triggerID.RequestID)
+-		if err == nil && status.Completed {
+-			return status, nil
+-		}
+-		time.Sleep(5 * time.Second)
+-	}
+-
+-	return status, err
+-}
+-
+-func (c *FlinkClient) TakeSavepointAsync(
+-	apiBaseURL string, jobID string, dir string) (string, error) {
+-	var triggerID = SavepointTriggerID{}
+-	var err error
+-
+-	triggerID, err = c.TriggerSavepoint(apiBaseURL, jobID, dir)
+-	if err != nil {
+-		return "", err
+-	}
+-
+-	return triggerID.RequestID, err
+-}
+diff --git a/controllers/flinkcluster_converter.go b/controllers/flinkcluster_converter.go
+index 1fd8d8c..fa47431 100644
+--- a/controllers/flinkcluster_converter.go
++++ b/controllers/flinkcluster_converter.go
+@@ -102,7 +102,7 @@ func getDesiredJobManagerStatefulSet(
+ 	var jobManagerStatefulSetName = getJobManagerStatefulSetName(clusterName)
+ 	var podLabels = getComponentLabels(*flinkCluster, "jobmanager")
+ 	podLabels = mergeLabels(podLabels, jobManagerSpec.PodLabels)
+-	var statefulSetLabels = mergeLabels(podLabels, getRevisionHashLabels(flinkCluster.Status))
++	var statefulSetLabels = mergeLabels(podLabels, getRevisionHashLabels(&flinkCluster.Status.Revision))
+ 	var securityContext = jobManagerSpec.SecurityContext
+ 	// Make Volume, VolumeMount to use configMap data for flink-conf.yaml, if flinkProperties is provided.
+ 	var volumes []corev1.Volume
+@@ -263,7 +263,7 @@ func getDesiredJobManagerService(
+ 	var jobManagerServiceName = getJobManagerServiceName(clusterName)
+ 	var podLabels = getComponentLabels(*flinkCluster, "jobmanager")
+ 	podLabels = mergeLabels(podLabels, jobManagerSpec.PodLabels)
+-	var serviceLabels = mergeLabels(podLabels, getRevisionHashLabels(flinkCluster.Status))
++	var serviceLabels = mergeLabels(podLabels, getRevisionHashLabels(&flinkCluster.Status.Revision))
+ 	var jobManagerService = &corev1.Service{
+ 		ObjectMeta: metav1.ObjectMeta{
+ 			Namespace: clusterNamespace,
+@@ -325,7 +325,7 @@ func getDesiredJobManagerIngress(
+ 	var ingressTLS []extensionsv1beta1.IngressTLS
+ 	var labels = mergeLabels(
+ 		getComponentLabels(*flinkCluster, "jobmanager"),
+-		getRevisionHashLabels(flinkCluster.Status))
++		getRevisionHashLabels(&flinkCluster.Status.Revision))
+ 	if jobManagerIngressSpec.HostFormat != nil {
+ 		ingressHost = getJobManagerIngressHost(*jobManagerIngressSpec.HostFormat, clusterName)
+ 	}
+@@ -400,7 +400,7 @@ func getDesiredTaskManagerStatefulSet(
+ 	var taskManagerStatefulSetName = getTaskManagerStatefulSetName(clusterName)
+ 	var podLabels = getComponentLabels(*flinkCluster, "taskmanager")
+ 	podLabels = mergeLabels(podLabels, taskManagerSpec.PodLabels)
+-	var statefulSetLabels = mergeLabels(podLabels, getRevisionHashLabels(flinkCluster.Status))
++	var statefulSetLabels = mergeLabels(podLabels, getRevisionHashLabels(&flinkCluster.Status.Revision))
+ 
+ 	var securityContext = taskManagerSpec.SecurityContext
+ 
+@@ -549,7 +549,7 @@ func getDesiredConfigMap(
+ 	var configMapName = getConfigMapName(clusterName)
+ 	var labels = mergeLabels(
+ 		getClusterLabels(*flinkCluster),
+-		getRevisionHashLabels(flinkCluster.Status))
++		getRevisionHashLabels(&flinkCluster.Status.Revision))
+ 	var flinkHeapSize = calFlinkHeapSize(flinkCluster)
+ 	// Properties which should be provided from real deployed environment.
+ 	var flinkProps = map[string]string{
+@@ -594,19 +594,18 @@ func getDesiredConfigMap(
+ // Gets the desired job spec from a cluster spec.
+ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
+ 	var flinkCluster = observed.cluster
++	var recorded = flinkCluster.Status
+ 	var jobSpec = flinkCluster.Spec.Job
+-	var jobStatus = flinkCluster.Status.Components.Job
++	var jobStatus = recorded.Components.Job
+ 
+ 	if jobSpec == nil {
+ 		return nil
+ 	}
+ 
+-	// Unless update has been triggered or the job needs to be restarted, keep the job to be stopped in that state.
+-	if !(isUpdateTriggered(flinkCluster.Status) || shouldRestartJob(jobSpec.RestartPolicy, jobStatus)) {
+-		// Job cancel requested or stopped already
+-		if isJobCancelRequested(*flinkCluster) || isJobStopped(jobStatus) {
+-			return nil
+-		}
++	// When the job should be stopped, keep that state unless update is triggered or the job must to be restarted.
++	if (shouldStopJob(flinkCluster) || isJobStopped(jobStatus)) &&
++		!(observed.isClusterUpdating() || shouldRestartJob(jobSpec, jobStatus)) {
++		return nil
+ 	}
+ 
+ 	var clusterSpec = flinkCluster.Spec
+@@ -621,14 +620,14 @@ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
+ 		"%s:%d", jobManagerServiceName, *jobManagerSpec.Ports.UI)
+ 	var podLabels = getClusterLabels(*flinkCluster)
+ 	podLabels = mergeLabels(podLabels, jobManagerSpec.PodLabels)
+-	var jobLabels = mergeLabels(podLabels, getRevisionHashLabels(flinkCluster.Status))
++	var jobLabels = mergeLabels(podLabels, getRevisionHashLabels(&recorded.Revision))
+ 	var jobArgs = []string{"bash", "/opt/flink-operator/submit-job.sh"}
+ 	jobArgs = append(jobArgs, "--jobmanager", jobManagerAddress)
+ 	if jobSpec.ClassName != nil {
+ 		jobArgs = append(jobArgs, "--class", *jobSpec.ClassName)
+ 	}
+ 
+-	var fromSavepoint = convertFromSavepoint(jobSpec, flinkCluster.Status.Components.Job)
++	var fromSavepoint = convertFromSavepoint(jobSpec, jobStatus, &recorded.Revision)
+ 	if fromSavepoint != nil {
+ 		jobArgs = append(jobArgs, "--fromSavepoint", *fromSavepoint)
+ 	}
+@@ -771,15 +770,16 @@ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
+ // Flink job will be restored from the latest savepoint created by the operator.
+ //
+ // case 3) When latest created savepoint is unavailable, use the savepoint from which current job was restored.
+-func convertFromSavepoint(jobSpec *v1beta1.JobSpec, jobStatus *v1beta1.JobStatus) *string {
++func convertFromSavepoint(jobSpec *v1beta1.JobSpec, jobStatus *v1beta1.JobStatus, revision *v1beta1.RevisionStatus) *string {
+ 	switch {
+ 	// Creating for the first time
+ 	case jobStatus == nil:
+-		if jobSpec.FromSavepoint != nil && *jobSpec.FromSavepoint != "" {
++		if !isBlank(jobSpec.FromSavepoint) {
+ 			return jobSpec.FromSavepoint
+ 		}
++		return nil
+ 	// Updating with FromSavepoint provided
+-	case jobStatus.State == v1beta1.JobStateUpdating && jobSpec.FromSavepoint != nil && *jobSpec.FromSavepoint != "":
++	case isUpdateTriggered(revision) && !isBlank(jobSpec.FromSavepoint):
+ 		return jobSpec.FromSavepoint
+ 	// Latest savepoint
+ 	case jobStatus.SavepointLocation != "":
+@@ -872,7 +872,7 @@ func shouldCleanup(
+ 		return false
+ 	}
+ 
+-	if isUpdateTriggered(cluster.Status) {
++	if isUpdateTriggered(&cluster.Status.Revision) {
+ 		return false
+ 	}
+ 
+@@ -1070,9 +1070,9 @@ func getComponentLabels(cluster v1beta1.FlinkCluster, component string) map[stri
+ 	})
+ }
+ 
+-func getRevisionHashLabels(status v1beta1.FlinkClusterStatus) map[string]string {
++func getRevisionHashLabels(r *v1beta1.RevisionStatus) map[string]string {
+ 	return map[string]string{
+-		RevisionNameLabel: getNextRevisionName(status),
++		RevisionNameLabel: getNextRevisionName(r),
+ 	}
+ }
+ 
+diff --git a/controllers/flinkcluster_converter_test.go b/controllers/flinkcluster_converter_test.go
+index 4bcae05..c881d63 100644
+--- a/controllers/flinkcluster_converter_test.go
++++ b/controllers/flinkcluster_converter_test.go
+@@ -273,7 +273,7 @@ func TestGetDesiredClusterState(t *testing.T) {
+ 				},
+ 			},
+ 			Status: v1beta1.FlinkClusterStatus{
+-				NextRevision: "flinkjobcluster-sample-85dc8f749-1",
++				Revision: v1beta1.RevisionStatus{NextRevision: "flinkjobcluster-sample-85dc8f749-1"},
+ 			},
+ 		},
+ 	}
+@@ -984,7 +984,7 @@ func TestSecurityContext(t *testing.T) {
+ 				},
+ 			},
+ 			Status: v1beta1.FlinkClusterStatus{
+-				NextRevision: "flinkjobcluster-sample-85dc8f749-1",
++				Revision: v1beta1.RevisionStatus{NextRevision: "flinkjobcluster-sample-85dc8f749-1"},
+ 			},
+ 		},
+ 	}
+@@ -1022,7 +1022,7 @@ func TestSecurityContext(t *testing.T) {
+ 				},
+ 			},
+ 			Status: v1beta1.FlinkClusterStatus{
+-				NextRevision: "flinkjobcluster-sample-85dc8f749-1",
++				Revision: v1beta1.RevisionStatus{NextRevision: "flinkjobcluster-sample-85dc8f749-1"},
+ 			},
+ 		},
+ 	}
+diff --git a/controllers/flinkcluster_observer.go b/controllers/flinkcluster_observer.go
+index b6abf1c..04ebfa9 100644
+--- a/controllers/flinkcluster_observer.go
++++ b/controllers/flinkcluster_observer.go
+@@ -24,6 +24,7 @@ import (
+ 	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
+ 	"github.com/googlecloudplatform/flink-operator/controllers/flinkclient"
+ 	"github.com/googlecloudplatform/flink-operator/controllers/history"
++	yaml "gopkg.in/yaml.v2"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	batchv1 "k8s.io/api/batch/v1"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -55,29 +56,65 @@ type ObservedClusterState struct {
+ 	jmService         *corev1.Service
+ 	jmIngress         *extensionsv1beta1.Ingress
+ 	tmStatefulSet     *appsv1.StatefulSet
+-	job               *batchv1.Job
+-	jobPod            *corev1.Pod
+-	flinkJobStatus    FlinkJobStatus
+-	flinkJobSubmitLog *FlinkJobSubmitLog
+-	savepoint         *Savepoint
+-	revisionStatus    *RevisionStatus
++	flinkJob          FlinkJob
++	flinkJobSubmitter FlinkJobSubmitter
++	savepoint         Savepoint
++	revision          Revision
+ 	observeTime       time.Time
++	updateState       UpdateState
+ }
+ 
+-type FlinkJobStatus struct {
+-	flinkJob            *flinkclient.JobStatus
+-	flinkJobList        *flinkclient.JobStatusList
+-	flinkJobsUnexpected []string
++type FlinkJob struct {
++	status     *flinkclient.JobStatus
++	list       *flinkclient.JobStatusList
++	unexpected []string
+ }
+ 
+-type FlinkJobSubmitLog struct {
++type FlinkJobSubmitter struct {
++	job *batchv1.Job
++	pod *corev1.Pod
++	log *SubmitterLog
++}
++
++type SubmitterLog struct {
+ 	JobID   string `yaml:"jobID,omitempty"`
+ 	Message string `yaml:"message"`
+ }
+ 
+ type Savepoint struct {
+-	*flinkclient.SavepointStatus
+-	savepointErr error
++	status *flinkclient.SavepointStatus
++	error  error
++}
++
++type Revision struct {
++	currentRevision *appsv1.ControllerRevision
++	nextRevision    *appsv1.ControllerRevision
++	collisionCount  int32
++}
++
++func (o *ObservedClusterState) isClusterUpdating() bool {
++	return o.updateState == UpdateStateInProgress
++}
++
++func (r *Revision) isUpdateTriggered() bool {
++	return getRevisionWithNameNumber(r.currentRevision) != getRevisionWithNameNumber(r.nextRevision)
++}
++
++// Job submitter status.
++func (s *FlinkJobSubmitter) getState() JobSubmitState {
++	switch {
++	case s.job == nil:
++		break
++	case s.job.Status.Succeeded == 0 && s.job.Status.Failed == 0:
++		return JobDeployStateInProgress
++	case s.job.Status.Failed > 0:
++		return JobDeployStateFailed
++	case s.job.Status.Succeeded > 0:
++		if s.log != nil && s.log.JobID != "" {
++			return JobDeployStateSucceeded
++		}
++	}
++	return JobDeployStateUnknown
+ }
+ 
+ // Observes the state of the cluster and its components.
+@@ -196,86 +233,122 @@ func (observer *ClusterStateObserver) observe(
+ 	}
+ 
+ 	// (Optional) Savepoint.
+-	// Savepoint observe error do not affect deploy reconciliation loop.
+-	observer.observeSavepoint(observed)
++	var observedSavepoint Savepoint
++	err = observer.observeSavepoint(observed.cluster, &observedSavepoint)
++	if err != nil {
++		log.Error(err, "Failed to get Flink job savepoint status")
++	} else {
++		log.Info("Observed Flink job savepoint status", "status", observedSavepoint.status)
++	}
++	observed.savepoint = observedSavepoint
+ 
+ 	// (Optional) job.
+ 	err = observer.observeJob(observed)
++	if err != nil {
++		log.Error(err, "Failed to get Flink job status")
++		return err
++	}
+ 
+ 	observed.observeTime = time.Now()
++	observed.updateState = getUpdateState(observed)
+ 
+-	return err
++	return nil
+ }
+ 
+ func (observer *ClusterStateObserver) observeJob(
+ 	observed *ObservedClusterState) error {
+-	if observed.cluster == nil {
++	// Either the cluster has been deleted or it is a session cluster.
++	if observed.cluster == nil || observed.cluster.Spec.Job == nil {
+ 		return nil
+ 	}
++	var log = observer.log
++	var recorded = observed.cluster.Status
++	var err error
+ 
+-	// Observe following
+-	var observedJob *batchv1.Job
+-	var observedFlinkJobStatus FlinkJobStatus
+-	var observedFlinkJobSubmitLog *FlinkJobSubmitLog
++	// Observe the Flink job submitter.
++	var submitter FlinkJobSubmitter
++	err = observer.observeSubmitter(&submitter)
++	if err != nil {
++		log.Error(err, "Failed to get the status of the job submitter")
++	}
++	observed.flinkJobSubmitter = submitter
+ 
+-	var recordedJobStatus = observed.cluster.Status.Components.Job
+-	var err error
++	// Observe the Flink job status.
++	var flinkJobID string
++	// Get the ID from the job submitter.
++	if submitter.log != nil && submitter.log.JobID != "" {
++		flinkJobID = submitter.log.JobID
++	} else
++	// Or get the job ID from the recorded job status which is written in previous iteration.
++	if recorded.Components.Job != nil {
++		flinkJobID = recorded.Components.Job.ID
++	}
++	var observedFlinkJob FlinkJob
++	observer.observeFlinkJobStatus(observed, flinkJobID, &observedFlinkJob)
++	observed.flinkJob = observedFlinkJob
++
++	return nil
++}
++
++func (observer *ClusterStateObserver) observeSubmitter(submitter *FlinkJobSubmitter) error {
+ 	var log = observer.log
++	var err error
+ 
+-	// Either the cluster has been deleted or it is a session cluster.
+-	if observed.cluster == nil || observed.cluster.Spec.Job == nil {
+-		return nil
+-	}
++	// Observe following
++	var job *batchv1.Job
++	var pod *corev1.Pod
++	var podLog *SubmitterLog
+ 
+ 	// Job resource.
+-	observedJob = new(batchv1.Job)
+-	err = observer.observeJobResource(observedJob)
++	job = new(batchv1.Job)
++	err = observer.observeSubmitterJob(job)
+ 	if err != nil {
+ 		if client.IgnoreNotFound(err) != nil {
+-			log.Error(err, "Failed to get job")
++			log.Error(err, "Failed to get the submitter job")
+ 			return err
+ 		}
+-		log.Info("Observed job submitter", "state", "nil")
+-		observedJob = nil
++		log.Info("Observed submitter job", "state", "nil")
++		job = nil
+ 	} else {
+-		log.Info("Observed job submitter", "state", *observedJob)
++		log.Info("Observed submitter job", "state", *job)
+ 	}
+-	observed.job = observedJob
+-
+-	// Get Flink job ID.
+-	// While job state is pending and job submitter is completed, extract the job ID from the pod termination log.
+-	var jobSubmitCompleted = observedJob != nil && (observedJob.Status.Succeeded > 0 || observedJob.Status.Failed > 0)
+-	var jobInPendingState = recordedJobStatus != nil && recordedJobStatus.State == v1beta1.JobStatePending
+-	var flinkJobID string
+-	if jobSubmitCompleted && jobInPendingState {
+-		var observedJobPod *corev1.Pod
+-
+-		// Get job submitter pod resource.
+-		observedJobPod = new(corev1.Pod)
+-		err = observer.observeJobPod(observedJobPod)
+-		if err != nil {
+-			log.Error(err, "Failed to get job pod")
+-		}
+-		observed.jobPod = observedJobPod
++	submitter.job = job
+ 
+-		// Extract submit result.
+-		observedFlinkJobSubmitLog, err = getFlinkJobSubmitLog(observedJobPod)
+-		if err != nil {
+-			log.Error(err, "Failed to extract job submit result")
+-		}
+-		if observedFlinkJobSubmitLog != nil && observedFlinkJobSubmitLog.JobID != "" {
+-			flinkJobID = observedFlinkJobSubmitLog.JobID
+-		}
+-		observed.flinkJobSubmitLog = observedFlinkJobSubmitLog
++	// Get the job submission log.
++	// When the recorded job state is pending or updating, and the actual submission is completed,
++	// extract the job submission log from the pod termination log.
++	if submitter.job == nil {
++		return nil
+ 	}
+-	// Or get the job ID from the recorded job status which is written previous iteration.
+-	if flinkJobID == "" && recordedJobStatus != nil {
+-		flinkJobID = recordedJobStatus.ID
++	// Get job submitter pod resource.
++	pod = new(corev1.Pod)
++	err = observer.observeJobSubmitterPod(pod)
++	if err != nil {
++		log.Error(err, "Failed to get the submitter pod")
++		return err
++	} else if pod == nil {
++		log.Info("Observed submitter job pod", "state", "nil")
++		return nil
++	} else {
++		log.Info("Observed submitter job pod", "state", *pod)
+ 	}
++	submitter.pod = pod
+ 
+-	// Flink job status.
+-	observer.observeFlinkJobStatus(observed, flinkJobID, &observedFlinkJobStatus)
+-	observed.flinkJobStatus = observedFlinkJobStatus
++	// Extract submit result.
++	var jobSubmissionCompleted = job.Status.Succeeded > 0 || job.Status.Failed > 0
++	if !jobSubmissionCompleted {
++		return nil
++	}
++	log.Info("Extracting the result of job submission because it is completed")
++	podLog = new(SubmitterLog)
++	err = observeFlinkJobSubmitterLog(pod, podLog)
++	if err != nil {
++		log.Error(err, "Failed to extract the job submission result")
++		podLog = nil
++	} else {
++		log.Info("Observed submitter log", "state", *podLog)
++	}
++	submitter.log = podLog
+ 
+ 	return nil
+ }
+@@ -288,11 +361,11 @@ func (observer *ClusterStateObserver) observeJob(
+ func (observer *ClusterStateObserver) observeFlinkJobStatus(
+ 	observed *ObservedClusterState,
+ 	flinkJobID string,
+-	flinkJobStatus *FlinkJobStatus) {
++	flinkJob *FlinkJob) {
+ 	var log = observer.log
+ 
+ 	// Observe following
+-	var flinkJob *flinkclient.JobStatus
++	var flinkJobStatus *flinkclient.JobStatus
+ 	var flinkJobList *flinkclient.JobStatusList
+ 	var flinkJobsUnexpected []string
+ 
+@@ -314,10 +387,7 @@ func (observer *ClusterStateObserver) observeFlinkJobStatus(
+ 		log.Info("Failed to get Flink job status list.", "error", err)
+ 		return
+ 	}
+-	log.Info("Observed Flink job status list", "jobs", flinkJobList.Jobs)
+-
+-	// Initialize flinkJobStatus if flink API is available.
+-	flinkJobStatus.flinkJobList = flinkJobList
++	flinkJob.list = flinkJobList
+ 
+ 	// Extract the current job status and unexpected jobs, if submitted job ID is provided.
+ 	if flinkJobID == "" {
+@@ -325,14 +395,13 @@ func (observer *ClusterStateObserver) observeFlinkJobStatus(
+ 	}
+ 	for _, job := range flinkJobList.Jobs {
+ 		if flinkJobID == job.ID {
+-			flinkJob = new(flinkclient.JobStatus)
+-			*flinkJob = job
++			flinkJobStatus = &job
+ 		} else if getFlinkJobDeploymentState(job.Status) == v1beta1.JobStateRunning {
+ 			flinkJobsUnexpected = append(flinkJobsUnexpected, job.ID)
+ 		}
+ 	}
+-	flinkJobStatus.flinkJob = flinkJob
+-	flinkJobStatus.flinkJobsUnexpected = flinkJobsUnexpected
++	flinkJob.status = flinkJobStatus
++	flinkJob.unexpected = flinkJobsUnexpected
+ 
+ 	// It is okay if there are multiple jobs, but at most one of them is
+ 	// expected to be running. This is typically caused by job client
+@@ -345,40 +414,30 @@ func (observer *ClusterStateObserver) observeFlinkJobStatus(
+ 			"", "unexpected jobs", flinkJobsUnexpected)
+ 	}
+ 	if flinkJob != nil {
+-		log.Info("Observed Flink job", "flink job", *flinkJob)
++		log.Info("Observed Flink job", "flink job", flinkJob)
+ 	}
+ 
+ 	return
+ }
+ 
+-func (observer *ClusterStateObserver) observeSavepoint(observed *ObservedClusterState) error {
+-	var log = observer.log
+-
+-	if observed.cluster == nil {
++func (observer *ClusterStateObserver) observeSavepoint(cluster *v1beta1.FlinkCluster, savepoint *Savepoint) error {
++	if cluster == nil ||
++		cluster.Status.Savepoint == nil ||
++		cluster.Status.Savepoint.State != v1beta1.SavepointStateInProgress {
+ 		return nil
+ 	}
+ 
+ 	// Get savepoint status in progress.
+-	var savepointStatus = observed.cluster.Status.Savepoint
+-	if savepointStatus != nil && savepointStatus.State == v1beta1.SavepointStateInProgress {
+-		var flinkAPIBaseURL = getFlinkAPIBaseURL(observed.cluster)
+-		var jobID = savepointStatus.JobID
+-		var triggerID = savepointStatus.TriggerID
+-		var savepoint flinkclient.SavepointStatus
+-		var err error
+-
+-		savepoint, err = observer.flinkClient.GetSavepointStatus(flinkAPIBaseURL, jobID, triggerID)
+-		observed.savepoint = &Savepoint{SavepointStatus: &savepoint}
+-		if err == nil && len(savepoint.FailureCause.StackTrace) > 0 {
+-			err = fmt.Errorf("%s", savepoint.FailureCause.StackTrace)
+-		}
+-		if err != nil {
+-			observed.savepoint.savepointErr = err
+-			log.Info("Failed to get savepoint.", "error", err, "jobID", jobID, "triggerID", triggerID)
+-		}
+-		return err
+-	}
+-	return nil
++	var flinkAPIBaseURL = getFlinkAPIBaseURL(cluster)
++	var recordedSavepoint = cluster.Status.Savepoint
++	var jobID = recordedSavepoint.JobID
++	var triggerID = recordedSavepoint.TriggerID
++
++	savepointStatus, err := observer.flinkClient.GetSavepointStatus(flinkAPIBaseURL, jobID, triggerID)
++	savepoint.status = &savepointStatus
++	savepoint.error = err
++
++	return err
+ }
+ 
+ func (observer *ClusterStateObserver) observeCluster(
+@@ -483,7 +542,7 @@ func (observer *ClusterStateObserver) observeJobManagerIngress(
+ 		observedIngress)
+ }
+ 
+-func (observer *ClusterStateObserver) observeJobResource(
++func (observer *ClusterStateObserver) observeSubmitterJob(
+ 	observedJob *batchv1.Job) error {
+ 	var clusterNamespace = observer.request.Namespace
+ 	var clusterName = observer.request.Name
+@@ -497,10 +556,9 @@ func (observer *ClusterStateObserver) observeJobResource(
+ 		observedJob)
+ }
+ 
+-// observeJobPod observes job submitter pod.
+-func (observer *ClusterStateObserver) observeJobPod(
++// observeJobSubmitterPod observes job submitter pod.
++func (observer *ClusterStateObserver) observeJobSubmitterPod(
+ 	observedPod *corev1.Pod) error {
+-	var log = observer.log
+ 	var clusterNamespace = observer.request.Namespace
+ 	var clusterName = observer.request.Name
+ 	var podSelector = labels.SelectorFromSet(map[string]string{"job-name": getJobName(clusterName)})
+@@ -512,25 +570,15 @@ func (observer *ClusterStateObserver) observeJobPod(
+ 		client.InNamespace(clusterNamespace),
+ 		client.MatchingLabelsSelector{Selector: podSelector})
+ 	if err != nil {
+-		if client.IgnoreNotFound(err) != nil {
+-			log.Error(err, "Failed to get job submitter pod list")
+-			return err
+-		}
+-		log.Info("Observed job submitter pod list", "state", "nil")
+-	} else {
+-		log.Info("Observed job submitter pod list", "state", *podList)
++		return err
+ 	}
+-
+-	if podList != nil && len(podList.Items) > 0 {
++	if len(podList.Items) == 0 {
++		observedPod = nil
++	} else {
+ 		podList.Items[0].DeepCopyInto(observedPod)
+ 	}
+-	return nil
+-}
+ 
+-type RevisionStatus struct {
+-	currentRevision *appsv1.ControllerRevision
+-	nextRevision    *appsv1.ControllerRevision
+-	collisionCount  int32
++	return nil
+ }
+ 
+ // syncRevisionStatus synchronizes current FlinkCluster resource and its child ControllerRevision resources.
+@@ -548,20 +596,19 @@ func (observer *ClusterStateObserver) syncRevisionStatus(observed *ObservedClust
+ 		return nil
+ 	}
+ 
+-	var revisions = observed.revisions
+ 	var cluster = observed.cluster
+-	var recordedStatus = cluster.Status
++	var revisions = observed.revisions
++	var recorded = cluster.Status
+ 	var currentRevision, nextRevision *appsv1.ControllerRevision
+ 	var controllerHistory = observer.history
+-	var revisionStatus = observed.revisionStatus
+ 
+ 	revisionCount := len(revisions)
+ 	history.SortControllerRevisions(revisions)
+ 
+ 	// Use a local copy of cluster.Status.CollisionCount to avoid modifying cluster.Status directly.
+ 	var collisionCount int32
+-	if recordedStatus.CollisionCount != nil {
+-		collisionCount = *recordedStatus.CollisionCount
++	if recorded.Revision.CollisionCount != nil {
++		collisionCount = *recorded.Revision.CollisionCount
+ 	}
+ 
+ 	// create a new revision from the current cluster
+@@ -594,12 +641,12 @@ func (observer *ClusterStateObserver) syncRevisionStatus(observed *ObservedClust
+ 	}
+ 
+ 	// if the current revision is nil we initialize the history by setting it to the next revision
+-	if recordedStatus.CurrentRevision == "" {
++	if recorded.Revision.CurrentRevision == "" {
+ 		currentRevision = nextRevision
+ 		// attempt to find the revision that corresponds to the current revision
+ 	} else {
+ 		for i := range revisions {
+-			if revisions[i].Name == getCurrentRevisionName(recordedStatus) {
++			if revisions[i].Name == getCurrentRevisionName(&recorded.Revision) {
+ 				currentRevision = revisions[i]
+ 				break
+ 			}
+@@ -609,12 +656,12 @@ func (observer *ClusterStateObserver) syncRevisionStatus(observed *ObservedClust
+ 		return fmt.Errorf("current ControlRevision resoucre not found")
+ 	}
+ 
+-	// update revision status
+-	revisionStatus = new(RevisionStatus)
+-	revisionStatus.currentRevision = currentRevision.DeepCopy()
+-	revisionStatus.nextRevision = nextRevision.DeepCopy()
+-	revisionStatus.collisionCount = collisionCount
+-	observed.revisionStatus = revisionStatus
++	// Update revision status.
++	observed.revision = Revision{
++		currentRevision: currentRevision.DeepCopy(),
++		nextRevision:    nextRevision.DeepCopy(),
++		collisionCount:  collisionCount,
++	}
+ 
+ 	// maintain the revision history limit
+ 	err = observer.truncateHistory(observed)
+@@ -646,3 +693,22 @@ func (observer *ClusterStateObserver) truncateHistory(observed *ObservedClusterS
+ 	}
+ 	return nil
+ }
++
++// observeFlinkJobSubmit extract submit result from the pod termination log.
++func observeFlinkJobSubmitterLog(observedPod *corev1.Pod, submitterLog *SubmitterLog) error {
++	var containerStatuses = observedPod.Status.ContainerStatuses
++	if len(containerStatuses) == 0 ||
++		containerStatuses[0].State.Terminated == nil ||
++		containerStatuses[0].State.Terminated.Message == "" {
++		return fmt.Errorf("job pod found, but no termination log")
++	}
++
++	// The job submission script writes the submission log to the pod termination log at the end of execution.
++	// If the job submission is successful, the extracted job ID is also included.
++	// The job submit script writes the submission result in YAML format,
++	// so parse it here to get the ID - if available - and log.
++	// Note: https://kubernetes.io/docs/tasks/debug-application-cluster/determine-reason-pod-failure/
++	var rawJobSubmissionResult = containerStatuses[0].State.Terminated.Message
++	var err = yaml.Unmarshal([]byte(rawJobSubmissionResult), submitterLog)
++	return err
++}
+diff --git a/controllers/flinkcluster_reconciler.go b/controllers/flinkcluster_reconciler.go
+index 7763b04..5d37ba5 100644
+--- a/controllers/flinkcluster_reconciler.go
++++ b/controllers/flinkcluster_reconciler.go
+@@ -65,7 +65,7 @@ func (reconciler *ClusterReconciler) reconcile() (ctrl.Result, error) {
+ 		return ctrl.Result{}, nil
+ 	}
+ 
+-	if getUpdateState(reconciler.observed) == UpdateStateInProgress {
++	if reconciler.observed.isClusterUpdating() {
+ 		reconciler.log.Info("The cluster update is in progress")
+ 	}
+ 	// If batch-scheduling enabled
+@@ -137,7 +137,8 @@ func (reconciler *ClusterReconciler) reconcileStatefulSet(
+ 	}
+ 
+ 	if desiredStatefulSet != nil && observedStatefulSet != nil {
+-		if getUpdateState(reconciler.observed) == UpdateStateInProgress {
++		var cluster = reconciler.observed.cluster
++		if reconciler.observed.isClusterUpdating() && !isComponentUpdated(observedStatefulSet, cluster) {
+ 			updateComponent := fmt.Sprintf("%v StatefulSet", component)
+ 			var err error
+ 			if *reconciler.observed.cluster.Spec.RecreateOnUpdate {
+@@ -150,7 +151,7 @@ func (reconciler *ClusterReconciler) reconcileStatefulSet(
+ 			}
+ 			return nil
+ 		}
+-		log.Info("Statefulset already exists, no action")
++		log.Info("StatefulSet already exists, no action")
+ 		return nil
+ 	}
+ 
+@@ -179,7 +180,7 @@ func (reconciler *ClusterReconciler) createStatefulSet(
+ 
+ func (reconciler *ClusterReconciler) deleteOldComponent(desired runtime.Object, observed runtime.Object, component string) error {
+ 	var log = reconciler.log.WithValues("component", component)
+-	if isComponentUpdated(observed, *reconciler.observed.cluster) {
++	if isComponentUpdated(observed, reconciler.observed.cluster) {
+ 		reconciler.log.Info(fmt.Sprintf("%v is already updated, no action", component))
+ 		return nil
+ 	}
+@@ -253,7 +254,8 @@ func (reconciler *ClusterReconciler) reconcileJobManagerService() error {
+ 	}
+ 
+ 	if desiredJmService != nil && observedJmService != nil {
+-		if getUpdateState(reconciler.observed) == UpdateStateInProgress {
++		var cluster = reconciler.observed.cluster
++		if reconciler.observed.isClusterUpdating() && !isComponentUpdated(observedJmService, cluster) {
+ 			// v1.Service API does not handle update correctly when below values are empty.
+ 			desiredJmService.SetResourceVersion(observedJmService.GetResourceVersion())
+ 			desiredJmService.Spec.ClusterIP = observedJmService.Spec.ClusterIP
+@@ -321,7 +323,8 @@ func (reconciler *ClusterReconciler) reconcileJobManagerIngress() error {
+ 	}
+ 
+ 	if desiredJmIngress != nil && observedJmIngress != nil {
+-		if getUpdateState(reconciler.observed) == UpdateStateInProgress {
++		var cluster = reconciler.observed.cluster
++		if reconciler.observed.isClusterUpdating() && !isComponentUpdated(observedJmIngress, cluster) {
+ 			var err error
+ 			if *reconciler.observed.cluster.Spec.RecreateOnUpdate {
+ 				err = reconciler.deleteOldComponent(desiredJmIngress, observedJmIngress, "JobManager ingress")
+@@ -386,7 +389,8 @@ func (reconciler *ClusterReconciler) reconcileConfigMap() error {
+ 	}
+ 
+ 	if desiredConfigMap != nil && observedConfigMap != nil {
+-		if getUpdateState(reconciler.observed) == UpdateStateInProgress {
++		var cluster = reconciler.observed.cluster
++		if reconciler.observed.isClusterUpdating() && !isComponentUpdated(observedConfigMap, cluster) {
+ 			var err error
+ 			if *reconciler.observed.cluster.Spec.RecreateOnUpdate {
+ 				err = reconciler.deleteOldComponent(desiredConfigMap, observedConfigMap, "ConfigMap")
+@@ -446,8 +450,9 @@ func (reconciler *ClusterReconciler) reconcileJob() (ctrl.Result, error) {
+ 	var log = reconciler.log
+ 	var desiredJob = reconciler.desired.Job
+ 	var observed = reconciler.observed
+-	var observedJob = observed.job
+-	var recordedJobStatus = observed.cluster.Status.Components.Job
++	var recorded = observed.cluster.Status
++	var jobSpec = observed.cluster.Spec.Job
++	var jobStatus = recorded.Components.Job
+ 	var activeFlinkJob bool
+ 	var err error
+ 	var jobID = reconciler.getFlinkJobID()
+@@ -457,51 +462,43 @@ func (reconciler *ClusterReconciler) reconcileJob() (ctrl.Result, error) {
+ 	var newControlStatus *v1beta1.FlinkClusterControlStatus
+ 	defer reconciler.updateStatus(&newSavepointStatus, &newControlStatus)
+ 
+-	// Cancel unexpected jobs
+-	if len(observed.flinkJobStatus.flinkJobsUnexpected) > 0 {
+-		log.Info("Cancelling unexpected running job(s)")
+-		err = reconciler.cancelUnexpectedJobs(false /* takeSavepoint */)
+-		return requeueResult, err
+-	}
+-
+ 	// Check if Flink job is active
+-	if isJobActive(recordedJobStatus) {
++	if isJobActive(jobStatus) {
+ 		activeFlinkJob = true
+-
+-		// Trigger savepoint if required.
+-		if len(jobID) > 0 {
+-			savepointTriggerReason := reconciler.shouldTakeSavepoint()
+-			if savepointTriggerReason != "" {
+-				newSavepointStatus, _ = reconciler.takeSavepointAsync(jobID, savepointTriggerReason)
+-				if userControl := getNewUserControlRequest(observed.cluster); userControl == v1beta1.ControlNameSavepoint {
+-					newControlStatus = getUserControlStatus(userControl, v1beta1.ControlStateInProgress)
+-				}
+-			}
+-		}
+ 	} else {
+ 		activeFlinkJob = false
+ 	}
+ 
+-	// Create Flink job submitter
++	// Create new Flink job submitter when starting new job, updating job or restarting job in failure.
+ 	if desiredJob != nil && !activeFlinkJob {
+-		// If update triggered, wait until all Flink cluster components are replaced with next revision.
+-		if !isClusterUpdateToDate(observed) {
+-			return requeueResult, nil
++		log.Info("Deploying Flink job")
++
++		var unexpectedJobs = observed.flinkJob.unexpected
++		if len(unexpectedJobs) > 0 {
++			if jobSpec.MaxStateAgeToRestoreSeconds != nil {
++				log.Info("Cancelling unexpected running job(s)")
++				err = reconciler.cancelUnexpectedJobs(false /* takeSavepoint */)
++				return requeueResult, err
++			}
++			// In this case the user should identify the cause of the problem
++			// so that the job is not accidentally executed multiple times by mistake or the Flink operator's error.
++			err = fmt.Errorf("failed to create job submitter, unexpected jobs found: %v", unexpectedJobs)
++			return ctrl.Result{}, err
+ 		}
+ 
+ 		// Create Flink job submitter
+ 		log.Info("Updating job status to proceed creating new job submitter")
+-		err = reconciler.updateStatusForNewJob()
++		// Job status must be updated before creating a job submitter to ensure the observed job is the job submitted by the operator.
++		err = reconciler.updateJobDeployStatus()
+ 		if err != nil {
+-			log.Info("Not proceed to create new job submitter because job status update failed")
++			log.Info("Failed to update the job status for job submission")
+ 			return requeueResult, err
+ 		}
+-		log.Info("Creating new job submitter")
+-		if observedJob != nil {
+-			log.Info("Deleting old job submitter")
+-			err = reconciler.deleteJob(observedJob)
++		var observedSubmitter = observed.flinkJobSubmitter.job
++		if observedSubmitter != nil {
++			log.Info("Found old job submitter")
++			err = reconciler.deleteJob(observedSubmitter)
+ 			if err != nil {
+-				log.Info("Failed to delete previous job submitter")
+ 				return requeueResult, err
+ 			}
+ 		}
+@@ -511,27 +508,31 @@ func (reconciler *ClusterReconciler) reconcileJob() (ctrl.Result, error) {
+ 	}
+ 
+ 	if desiredJob != nil && activeFlinkJob {
+-		var restartPolicy = observed.cluster.Spec.Job.RestartPolicy
+-		var recordedJobStatus = observed.cluster.Status.Components.Job
+-
+-		// Stop Flink job for update or recovery.
+-		var stopReason string
+-		if shouldUpdateJob(observed) {
+-			stopReason = "update"
+-			// Change job state.
+-			err := reconciler.changeJobStateToUpdating()
+-			if err != nil {
+-				log.Error(err, "Failed to change job status for update", "error", err)
+-				return requeueResult, err
++		if jobStatus.State == v1beta1.JobStateDeploying {
++			log.Info("Job submitter is deployed and wait until it is completed")
++			return requeueResult, nil
++		}
++		if isUpdateTriggered(&recorded.Revision) {
++			log.Info("Preparing job update")
++			var shouldSuspend = jobSpec.TakeSavepointOnUpdate == nil || *jobSpec.TakeSavepointOnUpdate == true || isBlank(jobSpec.FromSavepoint)
++			if shouldSuspend {
++				newSavepointStatus, err = reconciler.trySuspendJob()
++			} else {
++				err = reconciler.cancelJob()
+ 			}
+-		} else if shouldRestartJob(restartPolicy, recordedJobStatus) {
+-			stopReason = "recovery"
++			return requeueResult, err
+ 		}
+-		if stopReason != "" {
+-			log.Info(fmt.Sprintf("Restart job for %s.", stopReason))
+-			err := reconciler.restartJob()
+-			if err != nil {
+-				log.Info("Failed to restart job.")
++
++		// Trigger savepoint if required.
++		if len(jobID) > 0 {
++			var savepointTriggerReason = reconciler.shouldTakeSavepoint()
++			if savepointTriggerReason != "" {
++				newSavepointStatus, err = reconciler.triggerSavepoint(jobID, savepointTriggerReason, false)
++			}
++			// Get new control status when the savepoint reason matches the requested control.
++			var userControl = getNewControlRequest(observed.cluster)
++			if userControl == v1beta1.ControlNameSavepoint && savepointTriggerReason == v1beta1.SavepointTriggerReasonUserRequested {
++				newControlStatus = getControlStatus(userControl, v1beta1.ControlStateInProgress)
+ 			}
+ 			return requeueResult, err
+ 		}
+@@ -543,33 +544,15 @@ func (reconciler *ClusterReconciler) reconcileJob() (ctrl.Result, error) {
+ 	// Job cancel requested. Stop Flink job.
+ 	if desiredJob == nil && activeFlinkJob {
+ 		log.Info("Stopping job", "jobID", jobID)
+-		log.Info("Check savepoint status first.")
+-		var savepoint *v1beta1.SavepointStatus
+-		if newSavepointStatus != nil {
+-			savepoint = newSavepointStatus
+-		} else {
+-			savepoint = observed.cluster.Status.Savepoint
+-		}
+-		// If savepoint is taken, proceed to cancel job.
+-		var err = reconciler.cancelFlinkJobAsync(jobID, savepoint)
+-		// When there is an error, get failed status to record.
+-		if err != nil {
+-			log.Error(err, "Failed to cancel job", "jobID", jobID)
+-			newControlStatus = getFailedCancelStatus(err)
+-			return requeueResult, err
++		newSavepointStatus, err = reconciler.trySuspendJob()
++		var userControl = getNewControlRequest(observed.cluster)
++		if userControl == v1beta1.ControlNameJobCancel {
++			newControlStatus = getControlStatus(userControl, v1beta1.ControlStateInProgress)
+ 		}
+-		if userControl := getNewUserControlRequest(observed.cluster); userControl == v1beta1.ControlNameJobCancel {
+-			newControlStatus = getUserControlStatus(userControl, v1beta1.ControlStateInProgress)
+-		}
+-		// When savepoint is in progress yet, check it in next iteration.
+-		if savepoint != nil && savepoint.State == v1beta1.SavepointStateInProgress {
+-			return requeueResult, nil
+-		}
+-		log.Info("Successfully job cancelled.")
+-		return requeueResult, nil
++		return requeueResult, err
+ 	}
+ 
+-	if isJobStopped(recordedJobStatus) {
++	if isJobStopped(jobStatus) {
+ 		log.Info("Job has finished, no action")
+ 	}
+ 
+@@ -581,12 +564,12 @@ func (reconciler *ClusterReconciler) createJob(job *batchv1.Job) error {
+ 	var log = reconciler.log
+ 	var k8sClient = reconciler.k8sClient
+ 
+-	log.Info("Submitting job", "resource", *job)
++	log.Info("Creating job submitter", "resource", *job)
+ 	var err = k8sClient.Create(context, job)
+ 	if err != nil {
+-		log.Info("Failed to created job", "error", err)
++		log.Info("Failed to created job submitter", "error", err)
+ 	} else {
+-		log.Info("Job created")
++		log.Info("Job submitter created")
+ 	}
+ 	return err
+ }
+@@ -599,13 +582,13 @@ func (reconciler *ClusterReconciler) deleteJob(job *batchv1.Job) error {
+ 	var deletePolicy = metav1.DeletePropagationBackground
+ 	var deleteOption = client.DeleteOptions{PropagationPolicy: &deletePolicy}
+ 
+-	log.Info("Deleting job", "job", job)
++	log.Info("Deleting job submitter", "job", job)
+ 	var err = k8sClient.Delete(context, job, &deleteOption)
+ 	err = client.IgnoreNotFound(err)
+ 	if err != nil {
+-		log.Error(err, "Failed to delete job")
++		log.Error(err, "Failed to delete job submitter")
+ 	} else {
+-		log.Info("Job deleted")
++		log.Info("Job submitter deleted")
+ 	}
+ 	return err
+ }
+@@ -618,36 +601,55 @@ func (reconciler *ClusterReconciler) getFlinkJobID() string {
+ 	return ""
+ }
+ 
+-func (reconciler *ClusterReconciler) restartJob() error {
++func (reconciler *ClusterReconciler) trySuspendJob() (*v1beta1.SavepointStatus, error) {
++	var log = reconciler.log
++	var recorded = reconciler.observed.cluster.Status
++	var jobID = reconciler.getFlinkJobID()
++
++	log.Info("Checking the conditions for progressing")
++	var canSuspend = reconciler.canSuspendJob(jobID, recorded.Savepoint)
++	if canSuspend {
++		log.Info("Triggering savepoint for suspending job")
++		var newSavepointStatus, err = reconciler.triggerSavepoint(jobID, v1beta1.SavepointTriggerReasonUpdate, true)
++		if err != nil {
++			log.Info("Failed to trigger savepoint", "jobID", jobID, "triggerID", newSavepointStatus.TriggerID, "error", err)
++		} else {
++			log.Info("Successfully savepoint triggered", "jobID", jobID, "triggerID", newSavepointStatus.TriggerID)
++		}
++		return newSavepointStatus, err
++	}
++
++	return nil, nil
++}
++
++func (reconciler *ClusterReconciler) cancelJob() error {
+ 	var log = reconciler.log
+-	var observedJob = reconciler.observed.job
+-	var observedFlinkJob = reconciler.observed.flinkJobStatus.flinkJob
++	var observedFlinkJob = reconciler.observed.flinkJob.status
+ 
+-	log.Info("Stopping Flink job to restart", "", observedFlinkJob)
++	log.Info("Stopping Flink job", "", observedFlinkJob)
+ 	var err = reconciler.cancelRunningJobs(false /* takeSavepoint */)
+ 	if err != nil {
++		log.Info("Failed to stop Flink job")
+ 		return err
+ 	}
+ 
+-	if observedJob != nil {
+-		var err = reconciler.deleteJob(observedJob)
++	// TODO: It would be nice not to delete the job submitters immediately, and retain the latest ones for debug.
++	var observedSubmitter = reconciler.observed.flinkJobSubmitter.job
++	if observedSubmitter != nil {
++		var err = reconciler.deleteJob(observedSubmitter)
+ 		if err != nil {
+ 			log.Error(
+-				err, "Failed to delete job submitter", "job", observedJob)
++				err, "Failed to delete job submitter", "job", observedSubmitter)
+ 			return err
+ 		}
+ 	}
+ 
+-	// Do not create new job immediately, leave it to the next reconciliation,
+-	// because we still need to be able to create the new job if we encounter
+-	// ephemeral error here. It is better to organize the logic in a central place.
+-
+ 	return nil
+ }
+ 
+ func (reconciler *ClusterReconciler) cancelUnexpectedJobs(
+ 	takeSavepoint bool) error {
+-	var unexpectedJobs = reconciler.observed.flinkJobStatus.flinkJobsUnexpected
++	var unexpectedJobs = reconciler.observed.flinkJob.unexpected
+ 	return reconciler.cancelJobs(takeSavepoint, unexpectedJobs)
+ }
+ 
+@@ -655,8 +657,8 @@ func (reconciler *ClusterReconciler) cancelUnexpectedJobs(
+ func (reconciler *ClusterReconciler) cancelRunningJobs(
+ 	takeSavepoint bool) error {
+ 	var log = reconciler.log
+-	var runningJobs = reconciler.observed.flinkJobStatus.flinkJobsUnexpected
+-	var flinkJob = reconciler.observed.flinkJobStatus.flinkJob
++	var runningJobs = reconciler.observed.flinkJob.unexpected
++	var flinkJob = reconciler.observed.flinkJob.status
+ 	if flinkJob != nil && flinkJob.ID != "" &&
+ 		getFlinkJobDeploymentState(flinkJob.Status) == v1beta1.JobStateRunning {
+ 		runningJobs = append(runningJobs, flinkJob.ID)
+@@ -688,12 +690,11 @@ func (reconciler *ClusterReconciler) cancelJobs(
+ func (reconciler *ClusterReconciler) cancelFlinkJob(jobID string, takeSavepoint bool) error {
+ 	var log = reconciler.log
+ 	if takeSavepoint && canTakeSavepoint(*reconciler.observed.cluster) {
++		log.Info("Taking savepoint before stopping job", "jobID", jobID)
+ 		var err = reconciler.takeSavepoint(jobID)
+ 		if err != nil {
+ 			return err
+ 		}
+-	} else {
+-		log.Info("Skip taking savepoint before stopping job", "jobID", jobID)
+ 	}
+ 
+ 	var apiBaseURL = getFlinkAPIBaseURL(reconciler.observed.cluster)
+@@ -701,123 +702,103 @@ func (reconciler *ClusterReconciler) cancelFlinkJob(jobID string, takeSavepoint
+ 	return reconciler.flinkClient.StopJob(apiBaseURL, jobID)
+ }
+ 
+-// Trigger savepoint if it is possible, then return the savepoint status to update.
+-// When savepoint was already triggered, return the current observed status.
+-// If savepoint cannot be triggered, taking savepoint is skipped, or the triggered savepoint is completed, proceed to stop the job.
+-func (reconciler *ClusterReconciler) cancelFlinkJobAsync(jobID string, savepoint *v1beta1.SavepointStatus) error {
++// canSuspendJob
++func (reconciler *ClusterReconciler) canSuspendJob(jobID string, s *v1beta1.SavepointStatus) bool {
+ 	var log = reconciler.log
+-	var cluster = reconciler.observed.cluster
+-	var err error
++	var firstTry = !finalSavepointRequested(jobID, s)
++	if firstTry {
++		return true
++	}
+ 
+-	switch savepoint.State {
++	switch s.State {
+ 	case v1beta1.SavepointStateSucceeded:
+-		log.Info("Successfully savepoint created. Proceed to stop job.")
++		log.Info("Successfully savepoint completed, wait until the job stops")
++		return false
+ 	case v1beta1.SavepointStateInProgress:
+-		log.Info("Triggered savepoint already, wait until it is completed.")
+-		return nil
++		log.Info("Savepoint is in progress, wait until it is completed")
++		return false
+ 	case v1beta1.SavepointStateTriggerFailed:
+-		log.Info("Failed to trigger savepoint.")
+-		return fmt.Errorf("failed to trigger savepoint: %v", *savepoint)
+-	// Cannot be reached here with these states, because job-cancel control should be finished with failed savepoint states in updater.
++		log.Info("Savepoint trigger failed in previous request")
+ 	case v1beta1.SavepointStateFailed:
+-		fallthrough
+-	default:
+-		return fmt.Errorf("unexpected savepoint status: %v", *savepoint)
++		log.Info("Savepoint failed on previous request")
+ 	}
+ 
+-	var apiBaseURL = getFlinkAPIBaseURL(cluster)
+-	log.Info("Stopping job", "jobID", jobID)
+-	err = reconciler.flinkClient.StopJob(apiBaseURL, jobID)
+-	if err != nil {
+-		return fmt.Errorf("failed to stop job: %v", err)
++	var retryTimeArrived = hasTimeElapsed(s.UpdateTime, time.Now(), SavepointRequestRetryIntervalSec)
++	if !retryTimeArrived {
++		log.Info("Wait until next retry time arrived")
+ 	}
+-	return nil
++	return retryTimeArrived
+ }
+ 
+ func (reconciler *ClusterReconciler) shouldTakeSavepoint() string {
+-	var log = reconciler.log
+ 	var observed = reconciler.observed
+ 	var cluster = observed.cluster
+ 	var jobSpec = observed.cluster.Spec.Job
+ 	var jobStatus = observed.cluster.Status.Components.Job
+-	var savepointStatus = observed.cluster.Status.Savepoint
+-	var userControl = getNewUserControlRequest(cluster)
++	var newRequestedControl = getNewControlRequest(cluster)
+ 
+ 	if !canTakeSavepoint(*reconciler.observed.cluster) {
+ 		return ""
+ 	}
+ 
++	// Savepoint trigger priority is user request including update and job stop.
+ 	switch {
+-	// Triggered by user requested savepoint
+-	case userControl == v1beta1.ControlNameSavepoint:
+-		return v1beta1.SavepointTriggerReasonUserRequested
+-	// Triggered by user requested job cancel
+-	case userControl == v1beta1.ControlNameJobCancel:
++	// TODO: spec.job.cancelRequested will be deprecated
++	// Should stop job with savepoint by user requested control
++	case newRequestedControl == v1beta1.ControlNameJobCancel || (jobSpec.CancelRequested != nil && *jobSpec.CancelRequested):
+ 		return v1beta1.SavepointTriggerReasonJobCancel
+-	// Triggered by update
+-	case getUpdateState(observed) == UpdateStatePreparing:
+-		// TODO: apply exponential backoff retry
+-		// If failed to take savepoint, retry after SavepointRequestRetryIntervalSec.
+-		var takeSavepointOnUpdate = jobSpec.TakeSavepointOnUpdate == nil || *jobSpec.TakeSavepointOnUpdate == true
+-		if takeSavepointOnUpdate &&
+-			!isSavepointUpToDate(observed.observeTime, jobSpec, jobStatus) && // savepoint up to date
+-			(savepointStatus == nil || savepointStatus.State != v1beta1.SavepointStateInProgress) && // no savepoint in progress
+-			hasTimeElapsed(savepointStatus.UpdateTime, time.Now(), SavepointRequestRetryIntervalSec) { // retry interval arrived
+-			return v1beta1.SavepointTriggerReasonUpdate
+-		}
+-	// Triggered by schedule (auto savepoint)
++	// TODO: spec.job.savepointGeneration will be deprecated
++	// Take savepoint by user request
++	case newRequestedControl == v1beta1.ControlNameSavepoint:
++		fallthrough
++	case jobSpec.SavepointGeneration > jobStatus.SavepointGeneration:
++		// Triggered by savepointGeneration increased.
++		// When previous savepoint is failed, savepoint trigger by spec.job.savepointGeneration is not possible
++		// because the field cannot be increased more.
++		// Note: checkSavepointGeneration in flinkcluster_validate.go
++		return v1beta1.SavepointTriggerReasonUserRequested
++	// Scheduled auto savepoint
+ 	case jobSpec.AutoSavepointSeconds != nil:
+ 		// Check if next trigger time arrived.
+ 		var compareTime string
+-		if len(jobStatus.LastSavepointTime) == 0 {
++		if len(jobStatus.SavepointTime) == 0 {
+ 			compareTime = jobStatus.StartTime
+ 		} else {
+-			compareTime = jobStatus.LastSavepointTime
++			compareTime = jobStatus.SavepointTime
+ 		}
+ 		var nextTime = getTimeAfterAddedSeconds(compareTime, int64(*jobSpec.AutoSavepointSeconds))
+ 		if time.Now().After(nextTime) {
+ 			return v1beta1.SavepointTriggerReasonScheduled
+ 		}
+-	// TODO: spec.job.savepointGeneration will be deprecated
+-	// Triggered by savepointGeneration increased
+-	// When previous savepoint is failed, savepoint trigger by spec.job.savepointGeneration is not possible
+-	// because the field cannot be increased more by validator.
+-	// Note: checkSavepointGeneration in flinkcluster_validate.go
+-	case jobSpec.SavepointGeneration > jobStatus.SavepointGeneration:
+-		log.Info(
+-			"Savepoint is requested",
+-			"statusGen", jobStatus.SavepointGeneration,
+-			"specGen", jobSpec.SavepointGeneration)
+-		return v1beta1.SavepointTriggerReasonUserRequested
+ 	}
+ 
+ 	return ""
+ }
+ 
+ // Trigger savepoint for a job then return savepoint status to update.
+-func (reconciler *ClusterReconciler) takeSavepointAsync(jobID string, triggerReason string) (*v1beta1.SavepointStatus, error) {
++func (reconciler *ClusterReconciler) triggerSavepoint(jobID string, triggerReason string, cancel bool) (*v1beta1.SavepointStatus, error) {
+ 	var log = reconciler.log
+ 	var cluster = reconciler.observed.cluster
+ 	var apiBaseURL = getFlinkAPIBaseURL(reconciler.observed.cluster)
+ 	var triggerSuccess bool
+-	var triggerID string
++	var triggerID flinkclient.SavepointTriggerID
+ 	var message string
+ 	var err error
+ 
+ 	log.Info(fmt.Sprintf("Trigger savepoint for %s", triggerReason), "jobID", jobID)
+-	triggerID, err = reconciler.flinkClient.TakeSavepointAsync(apiBaseURL, jobID, *cluster.Spec.Job.SavepointsDir)
++	triggerID, err = reconciler.flinkClient.TriggerSavepoint(apiBaseURL, jobID, *cluster.Spec.Job.SavepointsDir, cancel)
+ 	if err != nil {
+ 		// limit message size to 1KiB
+ 		if message = err.Error(); len(message) > 1024 {
+ 			message = message[:1024] + "..."
+ 		}
+ 		triggerSuccess = false
+-		log.Info("Savepoint trigger is failed.", "jobID", jobID, "triggerID", triggerID, "error", err)
++		log.Info("Failed to trigger savepoint", "jobID", jobID, "triggerID", triggerID, "error", err)
+ 	} else {
+ 		triggerSuccess = true
+-		log.Info("Savepoint is triggered successfully.", "jobID", jobID, "triggerID", triggerID)
++		log.Info("Successfully savepoint triggered", "jobID", jobID, "triggerID", triggerID)
+ 	}
+-	newSavepointStatus := getNewSavepointStatus(jobID, triggerID, triggerReason, message, triggerSuccess)
++	newSavepointStatus := reconciler.getNewSavepointStatus(triggerID.RequestID, triggerReason, message, triggerSuccess)
+ 
+ 	return newSavepointStatus, err
+ }
+@@ -895,73 +876,56 @@ func (reconciler *ClusterReconciler) updateStatus(ss **v1beta1.SavepointStatus,
+ 	}
+ }
+ 
+-func (reconciler *ClusterReconciler) updateStatusForNewJob() error {
++func (reconciler *ClusterReconciler) updateJobDeployStatus() error {
+ 	var log = reconciler.log
+-	var newJobStatus *v1beta1.JobStatus
+-	var desiredJob = reconciler.desired.Job
+-	var clusterClone = reconciler.observed.cluster.DeepCopy()
++	var observedCluster = reconciler.observed.cluster
++	var desiredJobSubmitter = reconciler.desired.Job
+ 	var err error
+ 
+-	if clusterClone.Status.Components.Job != nil {
+-		newJobStatus = clusterClone.Status.Components.Job
+-		switch previousJobState := newJobStatus.State; previousJobState {
+-		case v1beta1.JobStateFailed:
+-			newJobStatus.RestartCount++
+-		case v1beta1.JobStateUpdating:
+-			newJobStatus.RestartCount = 0
+-		}
+-	} else {
+-		newJobStatus = &v1beta1.JobStatus{}
+-		clusterClone.Status.Components.Job = newJobStatus
+-	}
+-	var fromSavepoint = getFromSavepoint(desiredJob.Spec)
+-	newJobStatus.ID = ""
+-	newJobStatus.State = v1beta1.JobStatePending
+-	newJobStatus.FromSavepoint = fromSavepoint
+-	if newJobStatus.SavepointLocation != "" {
+-		// Latest savepoint should be "fromSavepoint"
+-		newJobStatus.SavepointLocation = fromSavepoint
++	var clusterClone = observedCluster.DeepCopy()
++	var newJob = clusterClone.Status.Components.Job
++
++	// Latest savepoint location should be fromSavepoint.
++	var fromSavepoint = getFromSavepoint(desiredJobSubmitter.Spec)
++	newJob.FromSavepoint = fromSavepoint
++	if newJob.SavepointLocation != "" {
++		newJob.SavepointLocation = fromSavepoint
+ 	}
++	setTimestamp(&newJob.DeployTime) // Mark as job submitter is deployed.
+ 	setTimestamp(&clusterClone.Status.LastUpdateTime)
+ 	err = reconciler.k8sClient.Status().Update(reconciler.context, clusterClone)
+ 
+ 	if err != nil {
+ 		log.Error(
+-			err, "Failed to update job status for new job submission", "error", err)
++			err, "Failed to update job status for new job submitter", "error", err)
+ 	} else {
+-		log.Info("Succeeded to update job status for new job submission.", "job status", newJobStatus)
++		log.Info("Succeeded to update job status for new job submitter.", "job status", newJob)
+ 	}
+ 	return err
+ }
+ 
+-func (reconciler *ClusterReconciler) changeJobStateToUpdating() error {
+-	var clusterClone = reconciler.observed.cluster.DeepCopy()
+-	var newJobStatus = clusterClone.Status.Components.Job
+-	newJobStatus.ID = ""
+-	newJobStatus.State = v1beta1.JobStateUpdating
+-	setTimestamp(&clusterClone.Status.LastUpdateTime)
+-	err := reconciler.k8sClient.Status().Update(reconciler.context, clusterClone)
+-	return err
+-}
+-
+-// If job cancellation is failed, fill the status message with error message.
+-// Then, the state will be transited to the failed by the updater.
+-func getFailedCancelStatus(cancelErr error) *v1beta1.FlinkClusterControlStatus {
+-	var state string
+-	var message string
++// getNewSavepointStatus returns newly triggered savepoint status.
++func (reconciler *ClusterReconciler) getNewSavepointStatus(triggerID string, triggerReason string, message string, triggerSuccess bool) *v1beta1.SavepointStatus {
++	var jobID = reconciler.getFlinkJobID()
++	var savepointState string
+ 	var now string
+ 	setTimestamp(&now)
+-	state = v1beta1.ControlStateInProgress
+-	// limit message size to 1KiB
+-	if message = cancelErr.Error(); len(message) > 1024 {
+-		message = message[:1024] + "..."
+-	}
+-	return &v1beta1.FlinkClusterControlStatus{
+-		Name:       v1beta1.ControlNameJobCancel,
+-		State:      state,
+-		UpdateTime: now,
+-		Message:    message,
+-	}
++
++	if triggerSuccess {
++		savepointState = v1beta1.SavepointStateInProgress
++	} else {
++		savepointState = v1beta1.SavepointStateTriggerFailed
++	}
++	var savepointStatus = &v1beta1.SavepointStatus{
++		JobID:         jobID,
++		TriggerID:     triggerID,
++		TriggerReason: triggerReason,
++		TriggerTime:   now,
++		UpdateTime:    now,
++		Message:       message,
++		State:         savepointState,
++	}
++	return savepointStatus
+ }
+ 
+ // Convert raw time to object and add `addedSeconds` to it,
+diff --git a/controllers/flinkcluster_updater.go b/controllers/flinkcluster_updater.go
+index 43cdf17..0e15fe7 100644
+--- a/controllers/flinkcluster_updater.go
++++ b/controllers/flinkcluster_updater.go
+@@ -22,9 +22,7 @@ package controllers
+ import (
+ 	"context"
+ 	"encoding/json"
+-	"errors"
+ 	"fmt"
+-	"github.com/googlecloudplatform/flink-operator/controllers/flinkclient"
+ 	"k8s.io/apimachinery/pkg/types"
+ 	"reflect"
+ 	"time"
+@@ -186,6 +184,7 @@ func (updater *ClusterStatusUpdater) createStatusChangeEvent(
+ 	}
+ }
+ 
++// TODO: Need to organize
+ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 	recorded *v1beta1.FlinkClusterStatus,
+ 	observed *ObservedClusterState) v1beta1.FlinkClusterStatus {
+@@ -193,13 +192,10 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 	var runningComponents = 0
+ 	// jmStatefulSet, jmService, tmStatefulSet.
+ 	var totalComponents = 3
+-	var updateState = getUpdateState(*observed)
+-	var isClusterUpdating = !isClusterUpdateToDate(*observed) && updateState == UpdateStateInProgress
+-	var isJobUpdating = recorded.Components.Job != nil && recorded.Components.Job.State == v1beta1.JobStateUpdating
+ 
+ 	// ConfigMap.
+ 	var observedConfigMap = observed.configMap
+-	if !isComponentUpdated(observedConfigMap, *observed.cluster) && isJobUpdating {
++	if !isComponentUpdated(observedConfigMap, observed.cluster) && observed.isClusterUpdating() {
+ 		recorded.Components.ConfigMap.DeepCopyInto(&status.Components.ConfigMap)
+ 		status.Components.ConfigMap.State = v1beta1.ComponentStateUpdating
+ 	} else if observedConfigMap != nil {
+@@ -215,7 +211,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 
+ 	// JobManager StatefulSet.
+ 	var observedJmStatefulSet = observed.jmStatefulSet
+-	if !isComponentUpdated(observedJmStatefulSet, *observed.cluster) && isJobUpdating {
++	if !isComponentUpdated(observedJmStatefulSet, observed.cluster) && observed.isClusterUpdating() {
+ 		recorded.Components.JobManagerStatefulSet.DeepCopyInto(&status.Components.JobManagerStatefulSet)
+ 		status.Components.JobManagerStatefulSet.State = v1beta1.ComponentStateUpdating
+ 	} else if observedJmStatefulSet != nil {
+@@ -234,7 +230,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 
+ 	// JobManager service.
+ 	var observedJmService = observed.jmService
+-	if !isComponentUpdated(observedJmService, *observed.cluster) && isJobUpdating {
++	if !isComponentUpdated(observedJmService, observed.cluster) && observed.isClusterUpdating() {
+ 		recorded.Components.JobManagerService.DeepCopyInto(&status.Components.JobManagerService)
+ 		status.Components.JobManagerService.State = v1beta1.ComponentStateUpdating
+ 	} else if observedJmService != nil {
+@@ -285,7 +281,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 
+ 	// (Optional) JobManager ingress.
+ 	var observedJmIngress = observed.jmIngress
+-	if !isComponentUpdated(observedJmIngress, *observed.cluster) && isJobUpdating {
++	if !isComponentUpdated(observedJmIngress, observed.cluster) && observed.isClusterUpdating() {
+ 		status.Components.JobManagerIngress = &v1beta1.JobManagerIngressStatus{}
+ 		recorded.Components.JobManagerIngress.DeepCopyInto(status.Components.JobManagerIngress)
+ 		status.Components.JobManagerIngress.State = v1beta1.ComponentStateUpdating
+@@ -368,7 +364,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 
+ 	// TaskManager StatefulSet.
+ 	var observedTmStatefulSet = observed.tmStatefulSet
+-	if !isComponentUpdated(observedTmStatefulSet, *observed.cluster) && isJobUpdating {
++	if !isComponentUpdated(observedTmStatefulSet, observed.cluster) && observed.isClusterUpdating() {
+ 		recorded.Components.TaskManagerStatefulSet.DeepCopyInto(&status.Components.TaskManagerStatefulSet)
+ 		status.Components.TaskManagerStatefulSet.State = v1beta1.ComponentStateUpdating
+ 	} else if observedTmStatefulSet != nil {
+@@ -388,10 +384,6 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 			}
+ 	}
+ 
+-	// (Optional) Job.
+-	// Update job status.
+-	status.Components.Job = updater.getJobStatus()
+-
+ 	// Derive the new cluster state.
+ 	switch recorded.State {
+ 	case "", v1beta1.ClusterStateCreating:
+@@ -401,10 +393,10 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 			status.State = v1beta1.ClusterStateRunning
+ 		}
+ 	case v1beta1.ClusterStateUpdating:
+-		if isClusterUpdating {
++		if observed.isClusterUpdating() {
+ 			status.State = v1beta1.ClusterStateUpdating
+ 		} else if runningComponents < totalComponents {
+-			if isUpdateTriggered(*recorded) {
++			if isUpdateTriggered(&recorded.Revision) {
+ 				status.State = v1beta1.ClusterStateUpdating
+ 			} else {
+ 				status.State = v1beta1.ClusterStateReconciling
+@@ -414,10 +406,10 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 		}
+ 	case v1beta1.ClusterStateRunning,
+ 		v1beta1.ClusterStateReconciling:
+-		var jobStatus = status.Components.Job
+-		if isClusterUpdating {
++		var jobStatus = recorded.Components.Job
++		if observed.isClusterUpdating() {
+ 			status.State = v1beta1.ClusterStateUpdating
+-		} else if isJobStopped(jobStatus) {
++		} else if !isUpdateTriggered(&recorded.Revision) && isJobStopped(jobStatus) {
+ 			var policy = observed.cluster.Spec.Job.CleanupPolicy
+ 			if jobStatus.State == v1beta1.JobStateSucceeded &&
+ 				policy.AfterJobSucceeds != v1beta1.CleanupActionKeepCluster {
+@@ -438,7 +430,8 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 		}
+ 	case v1beta1.ClusterStateStopping,
+ 		v1beta1.ClusterStatePartiallyStopped:
+-		if isClusterUpdating {
++		//if isClusterUpdating {
++		if observed.isClusterUpdating() {
+ 			status.State = v1beta1.ClusterStateUpdating
+ 		} else if runningComponents == 0 {
+ 			status.State = v1beta1.ClusterStateStopped
+@@ -448,7 +441,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 			status.State = v1beta1.ClusterStateStopping
+ 		}
+ 	case v1beta1.ClusterStateStopped:
+-		if isUpdateTriggered(*recorded) {
++		if isUpdateTriggered(&recorded.Revision) {
+ 			status.State = v1beta1.ClusterStateUpdating
+ 		} else {
+ 			status.State = v1beta1.ClusterStateStopped
+@@ -457,35 +450,33 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 		panic(fmt.Sprintf("Unknown cluster state: %v", recorded.State))
+ 	}
+ 
++	// (Optional) Job.
++	// Update job status.
++	status.Components.Job = updater.deriveJobStatus()
++
++	// (Optional) Savepoint.
+ 	// Update savepoint status if it is in progress or requested.
+-	status.Savepoint = updater.getUpdatedSavepointStatus(
+-		observed.savepoint,
++	var newJobStatus = status.Components.Job
++	status.Savepoint = updater.deriveSavepointStatus(
++		&observed.savepoint,
+ 		recorded.Savepoint,
+-		recorded.Components.Job,
++		newJobStatus,
+ 		updater.getFlinkJobID())
+ 
+-	// User requested control
+-	status.Control = getControlStatus(observed.cluster, &status, recorded)
+-
+-	// Update finished
+-	if updateState == UpdateStateFinished {
+-		status.CurrentRevision = observed.cluster.Status.NextRevision
+-		updater.log.Info("Finished update.")
+-	}
+-
+-	// Update revision status
+-	status.NextRevision = getRevisionWithNameNumber(observed.revisionStatus.nextRevision)
+-	if status.CurrentRevision == "" {
+-		if recorded.CurrentRevision == "" {
+-			status.CurrentRevision = getRevisionWithNameNumber(observed.revisionStatus.currentRevision)
+-		} else {
+-			status.CurrentRevision = recorded.CurrentRevision
+-		}
+-	}
+-	if observed.revisionStatus.collisionCount != 0 {
+-		status.CollisionCount = new(int32)
+-		*status.CollisionCount = observed.revisionStatus.collisionCount
+-	}
++	// (Optional) Control.
++	// Update user requested control status.
++	status.Control = deriveControlStatus(
++		observed.cluster,
++		status.Savepoint,
++		status.Components.Job,
++		recorded.Control)
++
++	// Update revision status.
++	// When update completed, finish the process by marking CurrentRevision to NextRevision.
++	status.Revision = deriveRevisionStatus(
++		observed.updateState,
++		&observed.revision,
++		&recorded.Revision)
+ 
+ 	return status
+ }
+@@ -496,16 +487,16 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ // to transient error or being skiped as an optimization.
+ // If this returned nil, it is the state that job is not submitted or not identified yet.
+ func (updater *ClusterStatusUpdater) getFlinkJobID() *string {
+-	// Observed from active job manager
+-	var observedFlinkJob = updater.observed.flinkJobStatus.flinkJob
++	// Observed from active job manager.
++	var observedFlinkJob = updater.observed.flinkJob.status
+ 	if observedFlinkJob != nil && len(observedFlinkJob.ID) > 0 {
+ 		return &observedFlinkJob.ID
+ 	}
+ 
+-	// Observed from job submitter (when job manager is not ready yet)
+-	var observedJobSubmitLog = updater.observed.flinkJobSubmitLog
+-	if observedJobSubmitLog != nil && observedJobSubmitLog.JobID != "" {
+-		return &observedJobSubmitLog.JobID
++	// Observed from job submitter (when Flink API is not ready).
++	var observedJobSubmitterLog = updater.observed.flinkJobSubmitter.log
++	if observedJobSubmitterLog != nil && observedJobSubmitterLog.JobID != "" {
++		return &observedJobSubmitterLog.JobID
+ 	}
+ 
+ 	// Recorded.
+@@ -517,98 +508,125 @@ func (updater *ClusterStatusUpdater) getFlinkJobID() *string {
+ 	return nil
+ }
+ 
+-func (updater *ClusterStatusUpdater) getJobStatus() *v1beta1.JobStatus {
++func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
+ 	var observed = updater.observed
+-	var observedJob = updater.observed.job
+-	var observedFlinkJob = updater.observed.flinkJobStatus.flinkJob
+-	var observedCluster = updater.observed.cluster
+-	var observedSavepoint = updater.observed.savepoint
+-	var recordedJobStatus = updater.observed.cluster.Status.Components.Job
+-	var newJobStatus *v1beta1.JobStatus
+-
+-	if recordedJobStatus == nil {
++	var observedCluster = observed.cluster
++	var jobSpec = observedCluster.Spec.Job
++	if jobSpec == nil {
+ 		return nil
+ 	}
+-	newJobStatus = recordedJobStatus.DeepCopy()
+ 
+-	// Derive job state
+-	var jobState string
++	var observedSubmitter = observed.flinkJobSubmitter
++	var observedFlinkJob = observed.flinkJob.status
++	var observedSavepoint = observed.savepoint
++	var recorded = observedCluster.Status
++	var savepoint = recorded.Savepoint
++	var oldJob = recorded.Components.Job
++	var newJob *v1beta1.JobStatus
++
++	// Derive new job state.
++	if oldJob != nil {
++		newJob = oldJob.DeepCopy()
++	} else {
++		newJob = new(v1beta1.JobStatus)
++	}
++	var newJobState string
++	var newJobID string
+ 	switch {
+-	// When updating stopped job
+-	case isUpdateTriggered(observedCluster.Status) && isJobStopped(recordedJobStatus):
+-		jobState = v1beta1.JobStateUpdating
+-	// Already terminated state
+-	case isJobTerminated(observedCluster.Spec.Job.RestartPolicy, recordedJobStatus):
+-		jobState = recordedJobStatus.State
+-	// Derive state from the observed Flink job
++	case oldJob == nil:
++		newJobState = v1beta1.JobStatePending
++	case observed.isClusterUpdating():
++		newJobState = v1beta1.JobStateUpdating
++	case shouldRestartJob(jobSpec, oldJob):
++		newJobState = v1beta1.JobStateRestarting
++	case isJobPending(oldJob) && oldJob.DeployTime != "":
++		newJobState = v1beta1.JobStateDeploying
++	case isJobStopped(oldJob):
++		newJobState = oldJob.State
++	// Derive the job state from the observed Flink job, if it exists.
+ 	case observedFlinkJob != nil:
+-		jobState = getFlinkJobDeploymentState(observedFlinkJob.Status)
+-		if jobState == "" {
+-			updater.log.Error(errors.New("failed to get Flink job deployment state"), "observed flink job status", observedFlinkJob.Status)
+-			jobState = recordedJobStatus.State
+-		}
+-	// When Flink job not found
+-	case isFlinkAPIReady(observed):
+-		switch recordedJobStatus.State {
+-		case v1beta1.JobStateRunning:
+-			jobState = v1beta1.JobStateLost
+-		case v1beta1.JobStatePending:
+-			// Flink job is submitted but not confirmed via job manager yet
+-			var jobSubmitSucceeded = updater.getFlinkJobID() != nil
+-			// Flink job submit is in progress
+-			var jobSubmitInProgress = observedJob != nil &&
+-				observedJob.Status.Succeeded == 0 &&
+-				observedJob.Status.Failed == 0
+-			if jobSubmitSucceeded || jobSubmitInProgress {
+-				jobState = v1beta1.JobStatePending
+-				break
+-			}
+-			jobState = v1beta1.JobStateFailed
+-		default:
+-			jobState = recordedJobStatus.State
++		newJobState = getFlinkJobDeploymentState(observedFlinkJob.Status)
++		// Unexpected Flink job state
++		if newJobState == "" {
++			panic(fmt.Sprintf("Unknown Flink job status: %s", observedFlinkJob.Status))
+ 		}
+-	// When Flink API unavailable
++		newJobID = observedFlinkJob.ID
++	// When Flink job not found in JobManager or JobManager is unavailable
++	case isFlinkAPIReady(observed.flinkJob.list):
++		if oldJob.State == v1beta1.JobStateRunning {
++			newJobState = v1beta1.JobStateLost
++			break
++		}
++		fallthrough
+ 	default:
+-		if recordedJobStatus.State == v1beta1.JobStatePending {
+-			var jobSubmitFailed = observedJob != nil && observedJob.Status.Failed > 0
+-			if jobSubmitFailed {
+-				jobState = v1beta1.JobStateFailed
+-				break
+-			}
++		if oldJob.State != v1beta1.JobStateDeploying {
++			newJobState = oldJob.State
++			break
++		}
++		// Job submitter is deployed but tracking failed.
++		var submitterState = observedSubmitter.getState()
++		if submitterState == JobDeployStateUnknown {
++			newJobState = v1beta1.JobStateLost
++			// Case in which the job submission clearly fails even if it is not confirmed by JobManager
++			// Job submitter is deployed but failed.
++		} else if submitterState == JobDeployStateFailed {
++			newJobState = v1beta1.JobStateDeployFailed
+ 		}
+-		jobState = recordedJobStatus.State
++		newJobState = oldJob.State
+ 	}
+-
+-	// Flink Job ID
+-	if jobState == v1beta1.JobStateUpdating {
+-		newJobStatus.ID = ""
+-	} else if observedFlinkJob != nil {
+-		newJobStatus.ID = observedFlinkJob.ID
++	newJob.State = newJobState
++	if newJobID != "" {
++		newJob.ID = newJobID
+ 	}
+ 
+-	// State
+-	newJobStatus.State = jobState
+-
+-	// Flink job start time
+-	// TODO: It would be nice to set StartTime with the timestamp retrieved from the Flink job API like /jobs/{job-id}.
+-	if jobState == v1beta1.JobStateRunning && newJobStatus.StartTime == "" {
+-		setTimestamp(&newJobStatus.StartTime)
++	// Derived new job status if the state is changed.
++	if oldJob == nil || oldJob.State != newJob.State {
++		// TODO: It would be ideal to set the times with the timestamp retrieved from the Flink API like /jobs/{job-id}.
++		switch {
++		case isJobPending(newJob):
++			newJob.DeployTime = ""
++			if newJob.State == v1beta1.JobStateUpdating {
++				newJob.RestartCount = 0
++			} else if newJob.State == v1beta1.JobStateRestarting {
++				newJob.RestartCount++
++			}
++		case newJob.State == v1beta1.JobStateDeploying:
++			newJob.ID = ""
++			newJob.StartTime = ""
++			newJob.EndTime = ""
++		case newJob.State == v1beta1.JobStateRunning:
++			setTimestamp(&newJob.StartTime)
++			newJob.EndTime = ""
++			// When job started, the savepoint is not the final state of the job any more.
++			if oldJob.FinalSavepoint {
++				newJob.FinalSavepoint = false
++			}
++		case isJobStopped(newJob):
++			if newJob.EndTime == "" {
++				setTimestamp(&newJob.EndTime)
++			}
++			// When tracking failed, we cannot guarantee if the savepoint is the final job state.
++			if newJob.State == v1beta1.JobStateLost && oldJob.FinalSavepoint {
++				newJob.FinalSavepoint = false
++			}
++		}
+ 	}
+ 
+ 	// Savepoint
+-	if newJobStatus != nil && observedSavepoint != nil && observedSavepoint.IsSuccessful() {
+-		newJobStatus.SavepointGeneration++
+-		newJobStatus.LastSavepointTriggerID = observedSavepoint.TriggerID
+-		newJobStatus.SavepointLocation = observedSavepoint.Location
+-
+-		// TODO: LastSavepointTime should be set with the timestamp generated in job manager.
++	if observedSavepoint.status != nil && observedSavepoint.status.IsSuccessful() {
++		newJob.SavepointGeneration++
++		newJob.SavepointLocation = observedSavepoint.status.Location
++		if finalSavepointRequested(newJob.ID, savepoint) {
++			newJob.FinalSavepoint = true
++		}
++		// TODO: SavepointTime should be set with the timestamp generated in job manager.
+ 		// Currently savepoint complete timestamp is not included in savepoints API response.
+ 		// Whereas checkpoint API returns the timestamp latest_ack_timestamp.
+ 		// Note: https://ci.apache.org/projects/flink/flink-docs-stable/ops/rest_api.html#jobs-jobid-checkpoints-details-checkpointid
+-		setTimestamp(&newJobStatus.LastSavepointTime)
++		setTimestamp(&newJob.SavepointTime)
+ 	}
+ 
+-	return newJobStatus
++	return newJob
+ }
+ 
+ func (updater *ClusterStatusUpdater) isStatusChanged(
+@@ -725,15 +743,17 @@ func (updater *ClusterStatusUpdater) isStatusChanged(
+ 			newStatus.Savepoint)
+ 		changed = true
+ 	}
+-	if newStatus.CurrentRevision != currentStatus.CurrentRevision ||
+-		newStatus.NextRevision != currentStatus.NextRevision ||
+-		(newStatus.CollisionCount != nil && currentStatus.CollisionCount == nil) ||
+-		(currentStatus.CollisionCount != nil && *newStatus.CollisionCount != *currentStatus.CollisionCount) {
++	var nr = newStatus.Revision     // New revision status
++	var cr = currentStatus.Revision // Current revision status
++	if nr.CurrentRevision != cr.CurrentRevision ||
++		nr.NextRevision != cr.NextRevision ||
++		(nr.CollisionCount != nil && cr.CollisionCount == nil) ||
++		(cr.CollisionCount != nil && *nr.CollisionCount != *cr.CollisionCount) {
+ 		updater.log.Info(
+ 			"FlinkCluster revision status changed", "current",
+-			fmt.Sprintf("currentRevision: %v, nextRevision: %v, collisionCount: %v", currentStatus.CurrentRevision, currentStatus.NextRevision, currentStatus.CollisionCount),
++			fmt.Sprintf("currentRevision: %v, nextRevision: %v, collisionCount: %v", cr.CurrentRevision, cr.NextRevision, cr.CollisionCount),
+ 			"new",
+-			fmt.Sprintf("currentRevision: %v, nextRevision: %v, collisionCount: %v", newStatus.CurrentRevision, newStatus.NextRevision, newStatus.CollisionCount))
++			fmt.Sprintf("currentRevision: %v, nextRevision: %v, collisionCount: %v", nr.CurrentRevision, nr.NextRevision, nr.CollisionCount))
+ 		changed = true
+ 	}
+ 	return changed
+@@ -776,46 +796,51 @@ func (updater *ClusterStatusUpdater) clearControlAnnotation(newControlStatus *v1
+ 	return nil
+ }
+ 
+-func (updater *ClusterStatusUpdater) getUpdatedSavepointStatus(
++func (updater *ClusterStatusUpdater) deriveSavepointStatus(
+ 	observedSavepoint *Savepoint,
+ 	recordedSavepointStatus *v1beta1.SavepointStatus,
+-	recordedJobStatus *v1beta1.JobStatus,
++	newJobStatus *v1beta1.JobStatus,
+ 	flinkJobID *string) *v1beta1.SavepointStatus {
+ 	if recordedSavepointStatus == nil {
+ 		return nil
+ 	}
+ 
+-	var savepointStatus = recordedSavepointStatus.DeepCopy()
++	// Derived savepoint status to return
++	var s = recordedSavepointStatus.DeepCopy()
+ 	var errMsg string
+-	if savepointStatus.State == v1beta1.SavepointStateInProgress && observedSavepoint != nil {
++
++	// Update the savepoint status when observed savepoint is found.
++	if s.State == v1beta1.SavepointStateInProgress && observedSavepoint != nil {
+ 		switch {
+-		case observedSavepoint.IsSuccessful():
+-			savepointStatus.State = v1beta1.SavepointStateSucceeded
+-		case observedSavepoint.IsFailed():
+-			savepointStatus.State = v1beta1.SavepointStateFailed
+-			errMsg = fmt.Sprintf("Savepoint error: %v", observedSavepoint.FailureCause.StackTrace)
+-		case observedSavepoint.savepointErr != nil:
+-			if err, ok := observedSavepoint.savepointErr.(*flinkclient.HTTPError); ok {
+-				savepointStatus.State = v1beta1.SavepointStateFailed
+-				errMsg = fmt.Sprintf("Failed to get savepoint status: %v", err)
+-			}
++		case observedSavepoint.status.IsSuccessful():
++			s.State = v1beta1.SavepointStateSucceeded
++		case observedSavepoint.status.IsFailed():
++			s.State = v1beta1.SavepointStateFailed
++			errMsg = fmt.Sprintf("Savepoint error: %v", observedSavepoint.status.FailureCause.StackTrace)
++		case observedSavepoint.error != nil:
++			s.State = v1beta1.SavepointStateFailed
++			errMsg = fmt.Sprintf("Failed to get savepoint status: %v", observedSavepoint.error)
+ 		}
+ 	}
+-	if savepointStatus.State == v1beta1.SavepointStateInProgress {
++
++	// Check failure conditions of savepoint in progress.
++	if s.State == v1beta1.SavepointStateInProgress {
+ 		switch {
+-		case isJobStopped(recordedJobStatus):
++		case isJobStopped(newJobStatus):
+ 			errMsg = "Flink job is stopped."
+-			savepointStatus.State = v1beta1.SavepointStateFailed
++			s.State = v1beta1.SavepointStateFailed
+ 		case flinkJobID == nil:
+ 			errMsg = "Flink job is not identified."
+-			savepointStatus.State = v1beta1.SavepointStateFailed
++			s.State = v1beta1.SavepointStateFailed
+ 		case flinkJobID != nil && (recordedSavepointStatus.TriggerID != "" && *flinkJobID != recordedSavepointStatus.JobID):
+ 			errMsg = "Savepoint triggered Flink job is lost."
+-			savepointStatus.State = v1beta1.SavepointStateFailed
++			s.State = v1beta1.SavepointStateFailed
+ 		}
+ 	}
++
++	// Make up message.
+ 	if errMsg != "" {
+-		if savepointStatus.TriggerReason == v1beta1.SavepointTriggerReasonUpdate {
++		if s.TriggerReason == v1beta1.SavepointTriggerReasonUpdate {
+ 			errMsg =
+ 				"Failed to take savepoint for update. " +
+ 					"The update process is being postponed until a savepoint is available. " + errMsg
+@@ -823,75 +848,96 @@ func (updater *ClusterStatusUpdater) getUpdatedSavepointStatus(
+ 		if len(errMsg) > 1024 {
+ 			errMsg = errMsg[:1024]
+ 		}
+-		savepointStatus.Message = errMsg
++		s.Message = errMsg
+ 	}
+-	return savepointStatus
++
++	return s
+ }
+ 
+-func getControlStatus(cluster *v1beta1.FlinkCluster,
+-	new *v1beta1.FlinkClusterStatus,
+-	recorded *v1beta1.FlinkClusterStatus) *v1beta1.FlinkClusterControlStatus {
+-	var userControl = cluster.Annotations[v1beta1.ControlAnnotation]
+-	var controlStatus *v1beta1.FlinkClusterControlStatus
+-	var controlRequest = getNewUserControlRequest(cluster)
++func deriveControlStatus(
++	cluster *v1beta1.FlinkCluster,
++	newSavepoint *v1beta1.SavepointStatus,
++	newJob *v1beta1.JobStatus,
++	recordedControl *v1beta1.FlinkClusterControlStatus) *v1beta1.FlinkClusterControlStatus {
++	var controlRequest = getNewControlRequest(cluster)
++
++	// Derived control status to return
++	var c *v1beta1.FlinkClusterControlStatus
+ 
+ 	// New control status
+ 	if controlRequest != "" {
+-		controlStatus = getUserControlStatus(controlRequest, v1beta1.ControlStateRequested)
+-		return controlStatus
++		c = getControlStatus(controlRequest, v1beta1.ControlStateRequested)
++		return c
+ 	}
+ 
+-	// Update control status in progress
+-	if recorded.Control != nil && userControl == recorded.Control.Name &&
+-		recorded.Control.State == v1beta1.ControlStateInProgress {
+-		controlStatus = recorded.Control.DeepCopy()
+-		switch recorded.Control.Name {
++	// Update control status in progress.
++	if recordedControl != nil && recordedControl.State == v1beta1.ControlStateInProgress {
++		c = recordedControl.DeepCopy()
++		switch recordedControl.Name {
+ 		case v1beta1.ControlNameJobCancel:
+-			if new.Components.Job.State == v1beta1.JobStateCancelled {
+-				controlStatus.State = v1beta1.ControlStateSucceeded
+-				setTimestamp(&controlStatus.UpdateTime)
+-			} else if isJobTerminated(cluster.Spec.Job.RestartPolicy, recorded.Components.Job) {
+-				controlStatus.Message = "Aborted job cancellation: job is terminated already."
+-				controlStatus.State = v1beta1.ControlStateFailed
+-				setTimestamp(&controlStatus.UpdateTime)
+-			} else if new.Savepoint != nil && new.Savepoint.State == v1beta1.SavepointStateFailed {
+-				controlStatus.Message = "Aborted job cancellation: failed to take savepoint."
+-				controlStatus.State = v1beta1.ControlStateFailed
+-				setTimestamp(&controlStatus.UpdateTime)
+-			} else if recorded.Control.Message != "" {
+-				controlStatus.State = v1beta1.ControlStateFailed
+-				setTimestamp(&controlStatus.UpdateTime)
++			if newSavepoint.State == v1beta1.SavepointStateSucceeded && newJob.State == v1beta1.JobStateCancelled {
++				c.State = v1beta1.ControlStateSucceeded
++			} else if isJobStopped(newJob) {
++				c.Message = "Aborted job cancellation: savepoint is not completed, but job is stopped already."
++				c.State = v1beta1.ControlStateFailed
++			} else if newSavepoint.TriggerReason == v1beta1.SavepointTriggerReasonJobCancel &&
++				(newSavepoint.State == v1beta1.SavepointStateFailed || newSavepoint.State == v1beta1.SavepointStateTriggerFailed) {
++				c.Message = "Aborted job cancellation: failed to take savepoint."
++				c.State = v1beta1.ControlStateFailed
+ 			}
+ 		case v1beta1.ControlNameSavepoint:
+-			if new.Savepoint != nil {
+-				if new.Savepoint.State == v1beta1.SavepointStateSucceeded {
+-					controlStatus.State = v1beta1.ControlStateSucceeded
+-					setTimestamp(&controlStatus.UpdateTime)
+-				} else if new.Savepoint.State == v1beta1.SavepointStateFailed || new.Savepoint.State == v1beta1.SavepointStateTriggerFailed {
+-					controlStatus.State = v1beta1.ControlStateFailed
+-					setTimestamp(&controlStatus.UpdateTime)
+-				}
++			if newSavepoint.State == v1beta1.SavepointStateSucceeded {
++				c.State = v1beta1.ControlStateSucceeded
++			} else if newSavepoint.TriggerReason == v1beta1.SavepointTriggerReasonUserRequested &&
++				(newSavepoint.State == v1beta1.SavepointStateFailed || newSavepoint.State == v1beta1.SavepointStateTriggerFailed) {
++				c.State = v1beta1.ControlStateFailed
+ 			}
+ 		}
+-		// Aborted by max retry reach
+-		var retries = controlStatus.Details[ControlRetries]
+-		if retries == ControlMaxRetries {
+-			controlStatus.Message = fmt.Sprintf("Aborted control %v. The maximum number of retries has been reached.", controlStatus.Name)
+-			controlStatus.State = v1beta1.ControlStateFailed
+-			setTimestamp(&controlStatus.UpdateTime)
++		// Update time when state changed.
++		if c.State != v1beta1.ControlStateInProgress {
++			setTimestamp(&c.UpdateTime)
+ 		}
+-		return controlStatus
++		return c
+ 	}
+-
+ 	// Maintain control status if there is no change.
+-	if recorded.Control != nil && controlStatus == nil {
+-		controlStatus = recorded.Control.DeepCopy()
+-		return controlStatus
++	if recordedControl != nil && c == nil {
++		c = recordedControl.DeepCopy()
++		return c
+ 	}
+ 
+ 	return nil
+ }
+ 
++func deriveRevisionStatus(
++	updateState UpdateState,
++	observedRevision *Revision,
++	recordedRevision *v1beta1.RevisionStatus,
++) v1beta1.RevisionStatus {
++	// Derived revision status
++	var r = v1beta1.RevisionStatus{}
++
++	// Finalize update process.
++	if updateState == UpdateStateFinished {
++		r.CurrentRevision = recordedRevision.NextRevision
++	}
++
++	// Update revision status.
++	r.NextRevision = getRevisionWithNameNumber(observedRevision.nextRevision)
++	if r.CurrentRevision == "" {
++		if recordedRevision.CurrentRevision == "" {
++			r.CurrentRevision = getRevisionWithNameNumber(observedRevision.currentRevision)
++		} else {
++			r.CurrentRevision = recordedRevision.CurrentRevision
++		}
++	}
++	if observedRevision.collisionCount != 0 {
++		r.CollisionCount = new(int32)
++		*r.CollisionCount = observedRevision.collisionCount
++	}
++
++	return r
++}
++
+ func getStatefulSetState(statefulSet *appsv1.StatefulSet) string {
+ 	if statefulSet.Status.ReadyReplicas >= *statefulSet.Spec.Replicas {
+ 		return v1beta1.ComponentStateReady
+diff --git a/controllers/flinkcluster_util.go b/controllers/flinkcluster_util.go
+index 5973d5a..8a9f709 100644
+--- a/controllers/flinkcluster_util.go
++++ b/controllers/flinkcluster_util.go
+@@ -21,8 +21,8 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
++	"github.com/googlecloudplatform/flink-operator/controllers/flinkclient"
+ 	"github.com/googlecloudplatform/flink-operator/controllers/history"
+-	"gopkg.in/yaml.v2"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	batchv1 "k8s.io/api/batch/v1"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -42,16 +42,21 @@ const (
+ 
+ 	RevisionNameLabel = "flinkoperator.k8s.io/revision-name"
+ 
+-	SavepointMaxAgeForUpdateSecondsDefault = 300 // 5 min
+-	SavepointRequestRetryIntervalSec       = 10
++	SavepointRequestRetryIntervalSec = 10
+ )
+ 
+ type UpdateState string
++type JobSubmitState string
+ 
+ const (
+ 	UpdateStatePreparing  UpdateState = "Preparing"
+ 	UpdateStateInProgress UpdateState = "InProgress"
+ 	UpdateStateFinished   UpdateState = "Finished"
++
++	JobDeployStateInProgress = "InProgress"
++	JobDeployStateSucceeded  = "Succeeded"
++	JobDeployStateFailed     = "Failed"
++	JobDeployStateUnknown    = "Unknown"
+ )
+ 
+ type objectForPatch struct {
+@@ -132,6 +137,10 @@ func setTimestamp(target *string) {
+ 	*target = tc.ToString(now)
+ }
+ 
++func isBlank(s *string) bool {
++	return s == nil || *s == "" || strings.TrimSpace(*s) == ""
++}
++
+ // Checks whether it is possible to take savepoint.
+ func canTakeSavepoint(cluster v1beta1.FlinkCluster) bool {
+ 	var jobSpec = cluster.Spec.Job
+@@ -142,30 +151,23 @@ func canTakeSavepoint(cluster v1beta1.FlinkCluster) bool {
+ 		(savepointStatus == nil || savepointStatus.State != v1beta1.SavepointStateInProgress)
+ }
+ 
++func shouldStopJob(cluster *v1beta1.FlinkCluster) bool {
++	var userControl = cluster.Annotations[v1beta1.ControlAnnotation]
++	var cancelRequested = cluster.Spec.Job.CancelRequested
++	return userControl == v1beta1.ControlNameJobCancel ||
++		(cancelRequested != nil && *cancelRequested)
++}
++
+ // shouldRestartJob returns true if the controller should restart failed or lost job.
+-// The controller can restart the job only if there is a savepoint to restore, recorded in status field.
++// The controller can restart the job only if there is a fresh savepoint to restore, recorded in status field.
+ func shouldRestartJob(
+-	restartPolicy *v1beta1.JobRestartPolicy,
++	jobSpec *v1beta1.JobSpec,
+ 	jobStatus *v1beta1.JobStatus) bool {
+-	return restartPolicy != nil &&
+-		*restartPolicy == v1beta1.JobRestartPolicyFromSavepointOnFailure &&
+-		jobStatus != nil &&
+-		(jobStatus.State == v1beta1.JobStateFailed || jobStatus.State == v1beta1.JobStateLost) &&
+-		len(jobStatus.SavepointLocation) > 0
+-}
+-
+-// shouldUpdateJob returns true if the controller should update the job.
+-// The controller should update the job when update is triggered and it is prepared to update.
+-// When the job is stopped, no savepoint is required, or the savepoint recorded in status field is up to date, it is ready to update.
+-func shouldUpdateJob(observed ObservedClusterState) bool {
+-	var jobStatus = observed.cluster.Status.Components.Job
+-	var jobSpec = observed.cluster.Spec.Job
+-	var takeSavepointOnUpdate = jobSpec.TakeSavepointOnUpdate == nil || *jobSpec.TakeSavepointOnUpdate == true
+-	var readyToUpdate = jobStatus == nil ||
+-		isJobStopped(jobStatus) ||
+-		!takeSavepointOnUpdate ||
+-		isSavepointUpToDate(observed.observeTime, jobSpec, jobStatus)
+-	return isUpdateTriggered(observed.cluster.Status) && readyToUpdate
++	var restartEnabled = jobSpec.RestartPolicy != nil && *jobSpec.RestartPolicy == v1beta1.JobRestartPolicyFromSavepointOnFailure
++	if restartEnabled && isJobFailed(jobStatus) && isSavepointUpToDate(jobSpec, jobStatus) {
++		return true
++	}
++	return false
+ }
+ 
+ func getFromSavepoint(jobSpec batchv1.JobSpec) string {
+@@ -242,12 +244,12 @@ func getNextRevisionNumber(revisions []*appsv1.ControllerRevision) int64 {
+ 	return revisions[count-1].Revision + 1
+ }
+ 
+-func getCurrentRevisionName(status v1beta1.FlinkClusterStatus) string {
+-	return status.CurrentRevision[:strings.LastIndex(status.CurrentRevision, "-")]
++func getCurrentRevisionName(r *v1beta1.RevisionStatus) string {
++	return r.CurrentRevision[:strings.LastIndex(r.CurrentRevision, "-")]
+ }
+ 
+-func getNextRevisionName(status v1beta1.FlinkClusterStatus) string {
+-	return status.NextRevision[:strings.LastIndex(status.NextRevision, "-")]
++func getNextRevisionName(r *v1beta1.RevisionStatus) string {
++	return r.NextRevision[:strings.LastIndex(r.NextRevision, "-")]
+ }
+ 
+ // Compose revision in FlinkClusterStatus with name and number of ControllerRevision
+@@ -270,7 +272,8 @@ func getRetryCount(data map[string]string) (string, error) {
+ 	return retries, err
+ }
+ 
+-func getNewUserControlRequest(cluster *v1beta1.FlinkCluster) string {
++// getNewControlRequest returns new requested control that is not in progress now.
++func getNewControlRequest(cluster *v1beta1.FlinkCluster) string {
+ 	var userControl = cluster.Annotations[v1beta1.ControlAnnotation]
+ 	var recorded = cluster.Status
+ 	if recorded.Control == nil || recorded.Control.State != v1beta1.ControlStateInProgress {
+@@ -279,7 +282,7 @@ func getNewUserControlRequest(cluster *v1beta1.FlinkCluster) string {
+ 	return ""
+ }
+ 
+-func getUserControlStatus(controlName string, state string) *v1beta1.FlinkClusterControlStatus {
++func getControlStatus(controlName string, state string) *v1beta1.FlinkClusterControlStatus {
+ 	var controlStatus = new(v1beta1.FlinkClusterControlStatus)
+ 	controlStatus.Name = controlName
+ 	controlStatus.State = state
+@@ -287,27 +290,6 @@ func getUserControlStatus(controlName string, state string) *v1beta1.FlinkCluste
+ 	return controlStatus
+ }
+ 
+-func getNewSavepointStatus(jobID string, triggerID string, triggerReason string, message string, triggerSuccess bool) *v1beta1.SavepointStatus {
+-	var savepointState string
+-	var now string
+-	setTimestamp(&now)
+-	if triggerSuccess {
+-		savepointState = v1beta1.SavepointStateInProgress
+-	} else {
+-		savepointState = v1beta1.SavepointStateTriggerFailed
+-	}
+-	var savepointStatus = &v1beta1.SavepointStatus{
+-		JobID:         jobID,
+-		TriggerID:     triggerID,
+-		TriggerReason: triggerReason,
+-		TriggerTime:   now,
+-		UpdateTime:    now,
+-		Message:       message,
+-		State:         savepointState,
+-	}
+-	return savepointStatus
+-}
+-
+ func getControlEvent(status v1beta1.FlinkClusterControlStatus) (eventType string, eventReason string, eventMessage string) {
+ 	var msg = status.Message
+ 	if len(msg) > 100 {
+@@ -364,33 +346,36 @@ func getSavepointEvent(status v1beta1.SavepointStatus) (eventType string, eventR
+ 	return
+ }
+ 
+-func isJobActive(status *v1beta1.JobStatus) bool {
+-	return status != nil &&
+-		(status.State == v1beta1.JobStateRunning || status.State == v1beta1.JobStatePending)
++func isJobActive(j *v1beta1.JobStatus) bool {
++	return j != nil &&
++		(j.State == v1beta1.JobStateRunning || j.State == v1beta1.JobStateDeploying)
+ }
+ 
+-func isJobStopped(status *v1beta1.JobStatus) bool {
+-	return status != nil &&
+-		(status.State == v1beta1.JobStateSucceeded ||
+-			status.State == v1beta1.JobStateFailed ||
+-			status.State == v1beta1.JobStateCancelled ||
+-			status.State == v1beta1.JobStateSuspended ||
+-			status.State == v1beta1.JobStateLost)
++func isJobPending(j *v1beta1.JobStatus) bool {
++	return j != nil &&
++		(j.State == v1beta1.JobStatePending ||
++			j.State == v1beta1.JobStateUpdating ||
++			j.State == v1beta1.JobStateRestarting)
+ }
+ 
+-func isJobCancelRequested(cluster v1beta1.FlinkCluster) bool {
+-	var userControl = cluster.Annotations[v1beta1.ControlAnnotation]
+-	var cancelRequested = cluster.Spec.Job.CancelRequested
+-	return userControl == v1beta1.ControlNameJobCancel ||
+-		(cancelRequested != nil && *cancelRequested)
++func isJobFailed(j *v1beta1.JobStatus) bool {
++	return j != nil &&
++		(j.State == v1beta1.JobStateFailed ||
++			j.State == v1beta1.JobStateLost ||
++			j.State == v1beta1.JobStateDeployFailed)
+ }
+ 
+-func isJobTerminated(restartPolicy *v1beta1.JobRestartPolicy, jobStatus *v1beta1.JobStatus) bool {
+-	return isJobStopped(jobStatus) && !shouldRestartJob(restartPolicy, jobStatus)
++func isJobStopped(j *v1beta1.JobStatus) bool {
++	return j != nil &&
++		(j.State == v1beta1.JobStateSucceeded ||
++			j.State == v1beta1.JobStateCancelled ||
++			j.State == v1beta1.JobStateFailed ||
++			j.State == v1beta1.JobStateLost ||
++			j.State == v1beta1.JobStateDeployFailed)
+ }
+ 
+-func isUpdateTriggered(status v1beta1.FlinkClusterStatus) bool {
+-	return status.CurrentRevision != status.NextRevision
++func isUpdateTriggered(r *v1beta1.RevisionStatus) bool {
++	return r.CurrentRevision != r.NextRevision
+ }
+ 
+ func isUserControlFinished(controlStatus *v1beta1.FlinkClusterControlStatus) bool {
+@@ -399,17 +384,21 @@ func isUserControlFinished(controlStatus *v1beta1.FlinkClusterControlStatus) boo
+ }
+ 
+ // Check if the savepoint is up to date.
+-func isSavepointUpToDate(now time.Time, jobSpec *v1beta1.JobSpec, jobStatus *v1beta1.JobStatus) bool {
+-	if jobStatus.SavepointLocation != "" && jobStatus.LastSavepointTime != "" {
+-		var spMaxAge int
+-		if jobSpec.SavepointMaxAgeForUpdateSeconds != nil {
+-			spMaxAge = int(*jobSpec.SavepointMaxAgeForUpdateSeconds)
+-		} else {
+-			spMaxAge = SavepointMaxAgeForUpdateSecondsDefault
+-		}
+-		if !hasTimeElapsed(jobStatus.LastSavepointTime, now, spMaxAge) {
+-			return true
+-		}
++func isSavepointUpToDate(jobSpec *v1beta1.JobSpec, jobStatus *v1beta1.JobStatus) bool {
++	if jobStatus.FinalSavepoint {
++		return true
++	}
++	if jobSpec.MaxStateAgeToRestoreSeconds == nil ||
++		jobStatus.SavepointLocation == "" ||
++		jobStatus.SavepointTime == "" ||
++		jobStatus.EndTime == "" {
++		return false
++	}
++	var tc = &TimeConverter{}
++	var jobEndTime = tc.FromString(jobStatus.EndTime)
++	var stateMaxAge = int(*jobSpec.MaxStateAgeToRestoreSeconds)
++	if !hasTimeElapsed(jobStatus.SavepointTime, jobEndTime, stateMaxAge) {
++		return true
+ 	}
+ 	return false
+ }
+@@ -429,8 +418,8 @@ func hasTimeElapsed(timeToCheckStr string, now time.Time, intervalSec int) bool
+ // If the component is observed as well as the next revision name in status.nextRevision and component's label `flinkoperator.k8s.io/hash` are equal, then it is updated already.
+ // If the component is not observed and it is required, then it is not updated yet.
+ // If the component is not observed and it is optional, but it is specified in the spec, then it is not updated yet.
+-func isComponentUpdated(component runtime.Object, cluster v1beta1.FlinkCluster) bool {
+-	if !isUpdateTriggered(cluster.Status) {
++func isComponentUpdated(component runtime.Object, cluster *v1beta1.FlinkCluster) bool {
++	if !isUpdateTriggered(&cluster.Status.Revision) {
+ 		return true
+ 	}
+ 	switch o := component.(type) {
+@@ -467,14 +456,14 @@ func isComponentUpdated(component runtime.Object, cluster v1beta1.FlinkCluster)
+ 	}
+ 
+ 	var labels, err = meta.NewAccessor().Labels(component)
+-	var nextRevisionName = getNextRevisionName(cluster.Status)
++	var nextRevisionName = getNextRevisionName(&cluster.Status.Revision)
+ 	if err != nil {
+ 		return false
+ 	}
+ 	return labels[RevisionNameLabel] == nextRevisionName
+ }
+ 
+-func areComponentsUpdated(components []runtime.Object, cluster v1beta1.FlinkCluster) bool {
++func areComponentsUpdated(components []runtime.Object, cluster *v1beta1.FlinkCluster) bool {
+ 	for _, c := range components {
+ 		if !isComponentUpdated(c, cluster) {
+ 			return false
+@@ -490,14 +479,14 @@ func isUpdatedAll(observed ObservedClusterState) bool {
+ 		observed.tmStatefulSet,
+ 		observed.jmService,
+ 		observed.jmIngress,
+-		observed.job,
++		observed.flinkJobSubmitter.job,
+ 	}
+-	return areComponentsUpdated(components, *observed.cluster)
++	return areComponentsUpdated(components, observed.cluster)
+ }
+ 
+ // isClusterUpdateToDate checks whether all cluster components are replaced to next revision.
+-func isClusterUpdateToDate(observed ObservedClusterState) bool {
+-	if !isUpdateTriggered(observed.cluster.Status) {
++func isClusterUpdateToDate(observed *ObservedClusterState) bool {
++	if !isUpdateTriggered(&observed.cluster.Status.Revision) {
+ 		return true
+ 	}
+ 	components := []runtime.Object{
+@@ -506,30 +495,55 @@ func isClusterUpdateToDate(observed ObservedClusterState) bool {
+ 		observed.tmStatefulSet,
+ 		observed.jmService,
+ 	}
+-	return areComponentsUpdated(components, *observed.cluster)
++	return areComponentsUpdated(components, observed.cluster)
+ }
+ 
+ // isFlinkAPIReady checks whether cluster is ready to submit job.
+-func isFlinkAPIReady(observed ObservedClusterState) bool {
++func isFlinkAPIReady(list *flinkclient.JobStatusList) bool {
+ 	// If the observed Flink job status list is not nil (e.g., emtpy list),
+ 	// it means Flink REST API server is up and running. It is the source of
+ 	// truth of whether we can submit a job.
+-	return observed.flinkJobStatus.flinkJobList != nil
++	return list != nil
+ }
+ 
+-func getUpdateState(observed ObservedClusterState) UpdateState {
+-	var recordedJobStatus = observed.cluster.Status.Components.Job
++// jobStateFinalized returns true, if job state is saved so that it can be resumed later.
++func finalSavepointRequested(jobID string, s *v1beta1.SavepointStatus) bool {
++	return s != nil && s.JobID == jobID &&
++		(s.TriggerReason == v1beta1.SavepointTriggerReasonUpdate ||
++			s.TriggerReason == v1beta1.SavepointTriggerReasonJobCancel)
++}
+ 
+-	switch {
+-	case !isUpdateTriggered(observed.cluster.Status):
++func updateReady(jobSpec *v1beta1.JobSpec, job *v1beta1.JobStatus) bool {
++	var takeSavepoint bool
++	if jobSpec != nil {
++		takeSavepoint = jobSpec.TakeSavepointOnUpdate == nil || *jobSpec.TakeSavepointOnUpdate
++	}
++	return job == nil ||
++		!isBlank(jobSpec.FromSavepoint) ||
++		!takeSavepoint ||
++		(isJobActive(job) && job.FinalSavepoint) ||
++		(!isJobActive(job) && isSavepointUpToDate(jobSpec, job))
++}
++
++func getUpdateState(observed *ObservedClusterState) UpdateState {
++	if observed.cluster == nil {
++		return ""
++	}
++	var recorded = observed.cluster.Status
++	var revision = recorded.Revision
++	var job = recorded.Components.Job
++	var jobSpec = observed.cluster.Spec.Job
++
++	if !isUpdateTriggered(&revision) {
+ 		return ""
+-	case isJobActive(recordedJobStatus):
++	}
++	switch {
++	case isJobActive(job) || !updateReady(jobSpec, job):
+ 		return UpdateStatePreparing
+-	case isClusterUpdateToDate(observed):
+-		return UpdateStateFinished
+-	default:
++	case !isClusterUpdateToDate(observed):
+ 		return UpdateStateInProgress
+ 	}
++	return UpdateStateFinished
+ }
+ 
+ func getNonLiveHistory(revisions []*appsv1.ControllerRevision, historyLimit int) []*appsv1.ControllerRevision {
+@@ -548,7 +562,7 @@ func getNonLiveHistory(revisions []*appsv1.ControllerRevision, historyLimit int)
+ 
+ func getFlinkJobDeploymentState(flinkJobState string) string {
+ 	switch flinkJobState {
+-	case "INITIALIZING", "CREATED", "RUNNING", "FAILING", "CANCELLING", "RESTARTING", "RECONCILING":
++	case "INITIALIZING", "CREATED", "RUNNING", "FAILING", "CANCELLING", "RESTARTING", "RECONCILING", "SUSPENDED":
+ 		return v1beta1.JobStateRunning
+ 	case "FINISHED":
+ 		return v1beta1.JobStateSucceeded
+@@ -556,36 +570,7 @@ func getFlinkJobDeploymentState(flinkJobState string) string {
+ 		return v1beta1.JobStateCancelled
+ 	case "FAILED":
+ 		return v1beta1.JobStateFailed
+-	case "SUSPENDED":
+-		return v1beta1.JobStateSuspended
+ 	default:
+ 		return ""
+ 	}
+ }
+-
+-// getFlinkJobSubmitLog extract submit result from the pod termination log.
+-func getFlinkJobSubmitLog(observedPod *corev1.Pod) (*FlinkJobSubmitLog, error) {
+-	if observedPod == nil {
+-		return nil, fmt.Errorf("no job pod found, even though submission completed")
+-	}
+-	var containerStatuses = observedPod.Status.ContainerStatuses
+-	if len(containerStatuses) == 0 ||
+-		containerStatuses[0].State.Terminated == nil ||
+-		containerStatuses[0].State.Terminated.Message == "" {
+-		return nil, fmt.Errorf("job pod found, but no termination log found even though submission completed")
+-	}
+-
+-	// The job submission script writes the submission log to the pod termination log at the end of execution.
+-	// If the job submission is successful, the extracted job ID is also included.
+-	// The job submit script writes the submission result in YAML format,
+-	// so parse it here to get the ID - if available - and log.
+-	// Note: https://kubernetes.io/docs/tasks/debug-application-cluster/determine-reason-pod-failure/
+-	var rawJobSubmitResult = containerStatuses[0].State.Terminated.Message
+-	var result = new(FlinkJobSubmitLog)
+-	var err = yaml.Unmarshal([]byte(rawJobSubmitResult), result)
+-	if err != nil {
+-		return nil, err
+-	}
+-
+-	return result, nil
+-}
+diff --git a/controllers/flinkcluster_util_test.go b/controllers/flinkcluster_util_test.go
+index 47a6faf..d0f9e6c 100644
+--- a/controllers/flinkcluster_util_test.go
++++ b/controllers/flinkcluster_util_test.go
+@@ -17,7 +17,6 @@ limitations under the License.
+ package controllers
+ 
+ import (
+-	"github.com/googlecloudplatform/flink-operator/controllers/flinkclient"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	batchv1 "k8s.io/api/batch/v1"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -48,27 +47,68 @@ func TestTimeConverter(t *testing.T) {
+ }
+ 
+ func TestShouldRestartJob(t *testing.T) {
++	var tc = &TimeConverter{}
+ 	var restartOnFailure = v1beta1.JobRestartPolicyFromSavepointOnFailure
+-	var jobStatus1 = v1beta1.JobStatus{
++	var neverRestart = v1beta1.JobRestartPolicyNever
++	var maxStateAgeToRestoreSeconds = int32(300) // 5 min
++
++	// Restart with savepoint up to date
++	var savepointTime = tc.ToString(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
++	var endTime = tc.ToString(time.Date(2020, 1, 1, 0, 1, 0, 0, time.UTC))
++	var jobSpec = v1beta1.JobSpec{
++		RestartPolicy:               &restartOnFailure,
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	var jobStatus = v1beta1.JobStatus{
+ 		State:             v1beta1.JobStateFailed,
+ 		SavepointLocation: "gs://my-bucket/savepoint-123",
++		SavepointTime:     savepointTime,
++		EndTime:           endTime,
++	}
++	var restart = shouldRestartJob(&jobSpec, &jobStatus)
++	assert.Equal(t, restart, true)
++
++	// Not restart without savepoint
++	jobSpec = v1beta1.JobSpec{
++		RestartPolicy:               &restartOnFailure,
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+ 	}
+-	var restart1 = shouldRestartJob(&restartOnFailure, &jobStatus1)
+-	assert.Equal(t, restart1, true)
++	jobStatus = v1beta1.JobStatus{
++		State:   v1beta1.JobStateFailed,
++		EndTime: endTime,
++	}
++	restart = shouldRestartJob(&jobSpec, &jobStatus)
++	assert.Equal(t, restart, false)
+ 
+-	var jobStatus2 = v1beta1.JobStatus{
+-		State: v1beta1.JobStateFailed,
++	// Not restart with restartPolicy Never
++	jobSpec = v1beta1.JobSpec{
++		RestartPolicy:               &neverRestart,
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	jobStatus = v1beta1.JobStatus{
++		State:             v1beta1.JobStateFailed,
++		SavepointLocation: "gs://my-bucket/savepoint-123",
++		SavepointTime:     savepointTime,
++		EndTime:           endTime,
+ 	}
+-	var restart2 = shouldRestartJob(&restartOnFailure, &jobStatus2)
+-	assert.Equal(t, restart2, false)
++	restart = shouldRestartJob(&jobSpec, &jobStatus)
++	assert.Equal(t, restart, false)
+ 
+-	var neverRestart = v1beta1.JobRestartPolicyNever
+-	var jobStatus3 = v1beta1.JobStatus{
++	// Not restart with old savepoint
++	savepointTime = tc.ToString(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
++	endTime = tc.ToString(time.Date(2020, 1, 1, 0, 5, 0, 0, time.UTC))
++	jobSpec = v1beta1.JobSpec{
++		RestartPolicy:               &neverRestart,
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	jobStatus = v1beta1.JobStatus{
+ 		State:             v1beta1.JobStateFailed,
+ 		SavepointLocation: "gs://my-bucket/savepoint-123",
++		SavepointTime:     savepointTime,
++		EndTime:           endTime,
+ 	}
+-	var restart3 = shouldRestartJob(&neverRestart, &jobStatus3)
+-	assert.Equal(t, restart3, false)
++	restart = shouldRestartJob(&jobSpec, &jobStatus)
++	assert.Equal(t, restart, false)
+ }
+ 
+ func TestGetRetryCount(t *testing.T) {
+@@ -220,108 +260,6 @@ func TestCanTakeSavepoint(t *testing.T) {
+ 	assert.Equal(t, take, false)
+ }
+ 
+-func TestShouldUpdateJob(t *testing.T) {
+-	// should update
+-	var tc = &TimeConverter{}
+-	var savepointTime = time.Now()
+-	var observeTime = savepointTime.Add(time.Second * 100)
+-	var savepointMaxAgeForUpdateSeconds = int32(300)
+-	var observed = ObservedClusterState{
+-		observeTime: observeTime,
+-		cluster: &v1beta1.FlinkCluster{
+-			Spec: v1beta1.FlinkClusterSpec{Job: &v1beta1.JobSpec{
+-				SavepointMaxAgeForUpdateSeconds: &savepointMaxAgeForUpdateSeconds,
+-			}},
+-			Status: v1beta1.FlinkClusterStatus{
+-				Components: v1beta1.FlinkClusterComponentsStatus{Job: &v1beta1.JobStatus{
+-					State:             v1beta1.JobStateRunning,
+-					LastSavepointTime: tc.ToString(savepointTime),
+-					SavepointLocation: "gs://my-bucket/savepoint-123",
+-				}},
+-				CurrentRevision: "1", NextRevision: "2",
+-			},
+-		},
+-	}
+-	var update = shouldUpdateJob(observed)
+-	assert.Equal(t, update, true)
+-
+-	// should update when update triggered and job failed.
+-	observed = ObservedClusterState{
+-		cluster: &v1beta1.FlinkCluster{
+-			Spec: v1beta1.FlinkClusterSpec{Job: &v1beta1.JobSpec{
+-				SavepointMaxAgeForUpdateSeconds: &savepointMaxAgeForUpdateSeconds,
+-			}},
+-			Status: v1beta1.FlinkClusterStatus{
+-				Components: v1beta1.FlinkClusterComponentsStatus{Job: &v1beta1.JobStatus{
+-					State: v1beta1.JobStateFailed,
+-				}},
+-				CurrentRevision: "1", NextRevision: "2",
+-			},
+-		},
+-	}
+-	update = shouldUpdateJob(observed)
+-	assert.Equal(t, update, true)
+-
+-	// cannot update with old savepoint
+-	tc = &TimeConverter{}
+-	savepointTime = time.Now()
+-	observeTime = savepointTime.Add(time.Second * 500)
+-	observed = ObservedClusterState{
+-		observeTime: observeTime,
+-		cluster: &v1beta1.FlinkCluster{
+-			Spec: v1beta1.FlinkClusterSpec{Job: &v1beta1.JobSpec{
+-				SavepointMaxAgeForUpdateSeconds: &savepointMaxAgeForUpdateSeconds,
+-			}},
+-			Status: v1beta1.FlinkClusterStatus{
+-				Components: v1beta1.FlinkClusterComponentsStatus{Job: &v1beta1.JobStatus{
+-					State:             v1beta1.JobStateRunning,
+-					LastSavepointTime: tc.ToString(savepointTime),
+-					SavepointLocation: "gs://my-bucket/savepoint-123",
+-				}},
+-				CurrentRevision: "1", NextRevision: "2",
+-			},
+-		},
+-	}
+-	update = shouldUpdateJob(observed)
+-	assert.Equal(t, update, false)
+-
+-	// cannot update without savepointLocation
+-	observed = ObservedClusterState{
+-		cluster: &v1beta1.FlinkCluster{
+-			Spec: v1beta1.FlinkClusterSpec{Job: &v1beta1.JobSpec{
+-				SavepointMaxAgeForUpdateSeconds: &savepointMaxAgeForUpdateSeconds,
+-			}},
+-			Status: v1beta1.FlinkClusterStatus{
+-				Components: v1beta1.FlinkClusterComponentsStatus{Job: &v1beta1.JobStatus{
+-					State: v1beta1.JobStateUpdating,
+-				}},
+-				CurrentRevision: "1", NextRevision: "2",
+-			},
+-		},
+-	}
+-	update = shouldUpdateJob(observed)
+-	assert.Equal(t, update, false)
+-
+-	// proceed update without savepointLocation if takeSavepoint is false.
+-	takeSavepointOnUpdate := false
+-	observed = ObservedClusterState{
+-		cluster: &v1beta1.FlinkCluster{
+-			Spec: v1beta1.FlinkClusterSpec{Job: &v1beta1.JobSpec{
+-				TakeSavepointOnUpdate:           &takeSavepointOnUpdate,
+-				SavepointMaxAgeForUpdateSeconds: &savepointMaxAgeForUpdateSeconds,
+-			}},
+-			Status: v1beta1.FlinkClusterStatus{
+-				Components: v1beta1.FlinkClusterComponentsStatus{Job: &v1beta1.JobStatus{
+-					State: v1beta1.JobStateUpdating,
+-				}},
+-				CurrentRevision: "1", NextRevision: "2",
+-			},
+-		},
+-	}
+-	update = shouldUpdateJob(observed)
+-	assert.Equal(t, update, true)
+-}
+-
+ func TestGetNextRevisionNumber(t *testing.T) {
+ 	var revisions []*appsv1.ControllerRevision
+ 	var nextRevision = getNextRevisionNumber(revisions)
+@@ -332,173 +270,90 @@ func TestGetNextRevisionNumber(t *testing.T) {
+ 	assert.Equal(t, nextRevision, int64(3))
+ }
+ 
+-func TestIsJobTerminated(t *testing.T) {
+-	var jobStatus = v1beta1.JobStatus{
+-		State: v1beta1.JobStateSucceeded,
+-	}
+-	var terminated = isJobTerminated(nil, &jobStatus)
+-	assert.Equal(t, terminated, true)
+-
+-	var restartOnFailure = v1beta1.JobRestartPolicyFromSavepointOnFailure
+-	jobStatus = v1beta1.JobStatus{
+-		State:             v1beta1.JobStateFailed,
+-		SavepointLocation: "gs://my-bucket/savepoint-123",
+-	}
+-	terminated = isJobTerminated(&restartOnFailure, &jobStatus)
+-	assert.Equal(t, terminated, false)
+-}
+-
+ func TestIsSavepointUpToDate(t *testing.T) {
+ 	var tc = &TimeConverter{}
+ 	var savepointTime = time.Now()
+-	var observeTime = savepointTime.Add(time.Second * 100)
+-	var savepointMaxAgeForUpdateSeconds = int32(300)
++	var jobEndTime = savepointTime.Add(time.Second * 100)
++	var maxStateAgeToRestoreSeconds = int32(300)
+ 	var jobSpec = v1beta1.JobSpec{
+-		SavepointMaxAgeForUpdateSeconds: &savepointMaxAgeForUpdateSeconds,
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+ 	}
+ 	var jobStatus = v1beta1.JobStatus{
+ 		State:             v1beta1.JobStateFailed,
+-		LastSavepointTime: tc.ToString(savepointTime),
++		SavepointTime:     tc.ToString(savepointTime),
+ 		SavepointLocation: "gs://my-bucket/savepoint-123",
+ 	}
+-	var update = isSavepointUpToDate(observeTime, &jobSpec, &jobStatus)
++	var update = isSavepointUpToDate(&jobSpec, &jobStatus)
+ 	assert.Equal(t, update, true)
+ 
+ 	// old
+ 	savepointTime = time.Now()
+-	observeTime = savepointTime.Add(time.Second * 500)
++	jobEndTime = savepointTime.Add(time.Second * 500)
+ 	jobStatus = v1beta1.JobStatus{
+ 		State:             v1beta1.JobStateFailed,
+-		LastSavepointTime: tc.ToString(savepointTime),
++		SavepointTime:     tc.ToString(savepointTime),
+ 		SavepointLocation: "gs://my-bucket/savepoint-123",
++		EndTime:           tc.ToString(jobEndTime),
+ 	}
+-	update = isSavepointUpToDate(observeTime, &jobSpec, &jobStatus)
++	update = isSavepointUpToDate(&jobSpec, &jobStatus)
+ 	assert.Equal(t, update, false)
+ 
+ 	// Fails without savepointLocation
+ 	savepointTime = time.Now()
+-	observeTime = savepointTime.Add(time.Second * 500)
++	jobEndTime = savepointTime.Add(time.Second * 500)
+ 	jobStatus = v1beta1.JobStatus{
+-		State:             v1beta1.JobStateFailed,
+-		LastSavepointTime: tc.ToString(savepointTime),
++		State:         v1beta1.JobStateFailed,
++		SavepointTime: tc.ToString(savepointTime),
++		EndTime:       tc.ToString(jobEndTime),
+ 	}
+-	update = isSavepointUpToDate(observeTime, &jobSpec, &jobStatus)
++	update = isSavepointUpToDate(&jobSpec, &jobStatus)
+ 	assert.Equal(t, update, false)
+ }
+ 
+ func TestIsComponentUpdated(t *testing.T) {
+ 	var cluster = v1beta1.FlinkCluster{
+-		Status: v1beta1.FlinkClusterStatus{NextRevision: "cluster-85dc8f749-2"},
++		Status: v1beta1.FlinkClusterStatus{Revision: v1beta1.RevisionStatus{NextRevision: "cluster-85dc8f749-2"}},
+ 	}
+ 	var cluster2 = v1beta1.FlinkCluster{
+ 		Spec: v1beta1.FlinkClusterSpec{
+ 			JobManager: v1beta1.JobManagerSpec{Ingress: &v1beta1.JobManagerIngressSpec{}},
+ 			Job:        &v1beta1.JobSpec{},
+ 		},
+-		Status: v1beta1.FlinkClusterStatus{NextRevision: "cluster-85dc8f749-2"},
++		Status: v1beta1.FlinkClusterStatus{Revision: v1beta1.RevisionStatus{NextRevision: "cluster-85dc8f749-2"}},
+ 	}
+ 	var deploy = &appsv1.Deployment{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+ 		RevisionNameLabel: "cluster-85dc8f749",
+ 	}}}
+-	var update = isComponentUpdated(deploy, cluster)
++	var update = isComponentUpdated(deploy, &cluster)
+ 	assert.Equal(t, update, true)
+ 
+ 	deploy = &appsv1.Deployment{}
+-	update = isComponentUpdated(deploy, cluster)
++	update = isComponentUpdated(deploy, &cluster)
+ 	assert.Equal(t, update, false)
+ 
+ 	deploy = nil
+-	update = isComponentUpdated(deploy, cluster)
++	update = isComponentUpdated(deploy, &cluster)
+ 	assert.Equal(t, update, false)
+ 
+ 	var job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
+ 		RevisionNameLabel: "cluster-85dc8f749",
+ 	}}}
+-	update = isComponentUpdated(job, cluster2)
++	update = isComponentUpdated(job, &cluster2)
+ 	assert.Equal(t, update, true)
+ 
+ 	job = &batchv1.Job{}
+-	update = isComponentUpdated(job, cluster2)
++	update = isComponentUpdated(job, &cluster2)
+ 	assert.Equal(t, update, false)
+ 
+ 	job = nil
+-	update = isComponentUpdated(job, cluster2)
++	update = isComponentUpdated(job, &cluster2)
+ 	assert.Equal(t, update, false)
+ 
+ 	job = nil
+-	update = isComponentUpdated(job, cluster)
++	update = isComponentUpdated(job, &cluster)
+ 	assert.Equal(t, update, true)
+ }
+ 
+-func TestIsFlinkAPIReady(t *testing.T) {
+-	var observed = ObservedClusterState{
+-		cluster: &v1beta1.FlinkCluster{
+-			Spec: v1beta1.FlinkClusterSpec{
+-				JobManager: v1beta1.JobManagerSpec{Ingress: &v1beta1.JobManagerIngressSpec{}},
+-				Job:        &v1beta1.JobSpec{},
+-			},
+-			Status: v1beta1.FlinkClusterStatus{NextRevision: "cluster-85dc8f749-2"},
+-		},
+-		configMap:      &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		jmStatefulSet:  &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		tmStatefulSet:  &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		jmService:      &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		flinkJobStatus: FlinkJobStatus{flinkJobList: &flinkclient.JobStatusList{}},
+-	}
+-	var ready = isFlinkAPIReady(observed)
+-	assert.Equal(t, ready, true)
+-
+-	// flinkJobList is nil
+-	observed = ObservedClusterState{
+-		cluster: &v1beta1.FlinkCluster{
+-			Spec: v1beta1.FlinkClusterSpec{
+-				JobManager: v1beta1.JobManagerSpec{Ingress: &v1beta1.JobManagerIngressSpec{}},
+-				Job:        &v1beta1.JobSpec{},
+-			},
+-			Status: v1beta1.FlinkClusterStatus{NextRevision: "cluster-85dc8f749-2"},
+-		},
+-		configMap:     &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		jmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		tmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		jmService:     &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-	}
+-	ready = isFlinkAPIReady(observed)
+-	assert.Equal(t, ready, false)
+-
+-	// jmStatefulSet is not observed
+-	observed = ObservedClusterState{
+-		cluster: &v1beta1.FlinkCluster{
+-			Spec: v1beta1.FlinkClusterSpec{
+-				JobManager: v1beta1.JobManagerSpec{Ingress: &v1beta1.JobManagerIngressSpec{}},
+-				Job:        &v1beta1.JobSpec{},
+-			},
+-			Status: v1beta1.FlinkClusterStatus{NextRevision: "cluster-85dc8f749-2"},
+-		},
+-		configMap:     &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		tmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		jmService:     &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-	}
+-	ready = isFlinkAPIReady(observed)
+-	assert.Equal(t, ready, false)
+-
+-	// jmStatefulSet is not updated
+-	observed = ObservedClusterState{
+-		cluster: &v1beta1.FlinkCluster{
+-			Spec: v1beta1.FlinkClusterSpec{
+-				JobManager: v1beta1.JobManagerSpec{Ingress: &v1beta1.JobManagerIngressSpec{}},
+-				Job:        &v1beta1.JobSpec{},
+-			},
+-			Status: v1beta1.FlinkClusterStatus{NextRevision: "cluster-85dc8f749-2"},
+-		},
+-		configMap:     &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		jmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
+-		tmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		jmService:     &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-	}
+-	ready = isFlinkAPIReady(observed)
+-	assert.Equal(t, ready, false)
+-}
+-
+ func TestGetUpdateState(t *testing.T) {
+ 	var observed = ObservedClusterState{
+ 		cluster: &v1beta1.FlinkCluster{
+@@ -507,16 +362,16 @@ func TestGetUpdateState(t *testing.T) {
+ 				Job:        &v1beta1.JobSpec{},
+ 			},
+ 			Status: v1beta1.FlinkClusterStatus{
+-				Components:      v1beta1.FlinkClusterComponentsStatus{Job: &v1beta1.JobStatus{State: v1beta1.JobStateRunning}},
+-				CurrentRevision: "cluster-85dc8f749-2", NextRevision: "cluster-aa5e3a87z-3"},
++				Components: v1beta1.FlinkClusterComponentsStatus{Job: &v1beta1.JobStatus{State: v1beta1.JobStateRunning}},
++				Revision:   v1beta1.RevisionStatus{CurrentRevision: "cluster-85dc8f749-2", NextRevision: "cluster-aa5e3a87z-3"}},
+ 		},
+-		job:           &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		configMap:     &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		jmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		tmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-		jmService:     &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
++		flinkJobSubmitter: FlinkJobSubmitter{job: &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}}},
++		configMap:         &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
++		jmStatefulSet:     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
++		tmStatefulSet:     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
++		jmService:         &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+ 	}
+-	var state = getUpdateState(observed)
++	var state = getUpdateState(&observed)
+ 	assert.Equal(t, state, UpdateStatePreparing)
+ 
+ 	observed = ObservedClusterState{
+@@ -525,13 +380,13 @@ func TestGetUpdateState(t *testing.T) {
+ 				JobManager: v1beta1.JobManagerSpec{Ingress: &v1beta1.JobManagerIngressSpec{}},
+ 				Job:        &v1beta1.JobSpec{},
+ 			},
+-			Status: v1beta1.FlinkClusterStatus{CurrentRevision: "cluster-85dc8f749-2", NextRevision: "cluster-aa5e3a87z-3"},
++			Status: v1beta1.FlinkClusterStatus{Revision: v1beta1.RevisionStatus{CurrentRevision: "cluster-85dc8f749-2", NextRevision: "cluster-aa5e3a87z-3"}},
+ 		},
+ 		jmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
+ 		tmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+ 		jmService:     &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+ 	}
+-	state = getUpdateState(observed)
++	state = getUpdateState(&observed)
+ 	assert.Equal(t, state, UpdateStateInProgress)
+ 
+ 	observed = ObservedClusterState{
+@@ -540,16 +395,16 @@ func TestGetUpdateState(t *testing.T) {
+ 				JobManager: v1beta1.JobManagerSpec{Ingress: &v1beta1.JobManagerIngressSpec{}},
+ 				Job:        &v1beta1.JobSpec{},
+ 			},
+-			Status: v1beta1.FlinkClusterStatus{CurrentRevision: "cluster-85dc8f749-2", NextRevision: "cluster-aa5e3a87z-3"},
++			Status: v1beta1.FlinkClusterStatus{Revision: v1beta1.RevisionStatus{CurrentRevision: "cluster-85dc8f749-2", NextRevision: "cluster-aa5e3a87z-3"}},
+ 		},
+-		job:           &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
+-		configMap:     &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
+-		jmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
+-		tmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
+-		jmService:     &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
+-		jmIngress:     &extensionsv1beta1.Ingress{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
+-	}
+-	state = getUpdateState(observed)
++		flinkJobSubmitter: FlinkJobSubmitter{job: &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}}},
++		configMap:         &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
++		jmStatefulSet:     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
++		tmStatefulSet:     &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
++		jmService:         &corev1.Service{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
++		jmIngress:         &extensionsv1beta1.Ingress{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
++	}
++	state = getUpdateState(&observed)
+ 	assert.Equal(t, state, UpdateStateFinished)
+ }
+ 
+@@ -602,54 +457,3 @@ func TestGetNonLiveHistory(t *testing.T) {
+ 	nonLiveHistory = getNonLiveHistory(revisions, historyLimit)
+ 	assert.Equal(t, len(nonLiveHistory), 0)
+ }
+-
+-func TestGetFlinkJobDeploymentState(t *testing.T) {
+-	var pod corev1.Pod
+-	var submit, expected *FlinkJobSubmitLog
+-	var err error
+-	var termMsg string
+-
+-	// success
+-	termMsg = `
+-jobID: ec74209eb4e3db8ae72db00bd7a830aa
+-message: |
+-  Successfully submitted!
+-  /opt/flink/bin/flink run --jobmanager flinkjobcluster-sample-jobmanager:8081 --class org.apache.flink.streaming.examples.wordcount.WordCount --parallelism 2 --detached ./examples/streaming/WordCount.jar --input ./README.txt
+-  Starting execution of program
+-  Printing result to stdout. Use --output to specify output path.
+-  Job has been submitted with JobID ec74209eb4e3db8ae72db00bd7a830aa
+-`
+-	expected = &FlinkJobSubmitLog{
+-		JobID: "ec74209eb4e3db8ae72db00bd7a830aa",
+-		Message: `Successfully submitted!
+-/opt/flink/bin/flink run --jobmanager flinkjobcluster-sample-jobmanager:8081 --class org.apache.flink.streaming.examples.wordcount.WordCount --parallelism 2 --detached ./examples/streaming/WordCount.jar --input ./README.txt
+-Starting execution of program
+-Printing result to stdout. Use --output to specify output path.
+-Job has been submitted with JobID ec74209eb4e3db8ae72db00bd7a830aa
+-`,
+-	}
+-	pod = corev1.Pod{
+-		Status: corev1.PodStatus{
+-			ContainerStatuses: []corev1.ContainerStatus{{
+-				State: corev1.ContainerState{
+-					Terminated: &corev1.ContainerStateTerminated{
+-						Message: termMsg,
+-					}}}}}}
+-	submit, _ = getFlinkJobSubmitLog(&pod)
+-	assert.DeepEqual(t, *submit, *expected)
+-
+-	// failed: pod not found
+-	submit, err = getFlinkJobSubmitLog(nil)
+-	assert.Error(t, err, "no job pod found, even though submission completed")
+-
+-	// failed: message not found
+-	pod = corev1.Pod{
+-		Status: corev1.PodStatus{
+-			ContainerStatuses: []corev1.ContainerStatus{{
+-				State: corev1.ContainerState{
+-					Terminated: &corev1.ContainerStateTerminated{
+-						Message: "",
+-					}}}}}}
+-	submit, err = getFlinkJobSubmitLog(&pod)
+-	assert.Error(t, err, "job pod found, but no termination log found even though submission completed")
+-}
+-- 
+1.8.3.1
+

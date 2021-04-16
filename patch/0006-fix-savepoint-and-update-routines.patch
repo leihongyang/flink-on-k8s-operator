@@ -1,0 +1,1996 @@
+From f71e84a739753251d3f712879861385fb89852b2 Mon Sep 17 00:00:00 2001
+From: elanv <elanv.dev@gmail.com>
+Date: Mon, 5 Apr 2021 13:30:53 +0900
+Subject: [PATCH 6/6] fix savepoint and update routines
+
+- fix handling failed auto savepoint
+- fix validations and tests related to changes
+- improve update routine
+- change the behavior of handling unexpected jobs
+- add a constraint for update: when takeSavepointOnUpdate is true, latest savepoint age should be less than maxStateAgeToRestore
+---
+ api/v1beta1/flinkcluster_default.go                |   4 -
+ api/v1beta1/flinkcluster_default_test.go           |  33 ++--
+ api/v1beta1/flinkcluster_types.go                  |  18 +-
+ api/v1beta1/flinkcluster_types_util.go             | 147 ++++++++++++++
+ api/v1beta1/flinkcluster_types_util_test.go        | 154 +++++++++++++++
+ api/v1beta1/flinkcluster_validate.go               |  79 ++++----
+ api/v1beta1/flinkcluster_validate_test.go          | 219 ++++++++++++++-------
+ api/v1beta1/zz_generated.deepcopy.go               |  15 ++
+ .../bases/flinkoperator.k8s.io_flinkclusters.yaml  |   1 +
+ controllers/flinkcluster_converter.go              |   8 +-
+ controllers/flinkcluster_observer.go               |  42 ++--
+ controllers/flinkcluster_observer_test.go          |  15 +-
+ controllers/flinkcluster_reconciler.go             | 108 +++++-----
+ controllers/flinkcluster_updater.go                |  61 +++---
+ controllers/flinkcluster_util.go                   | 108 +++-------
+ controllers/flinkcluster_util_test.go              | 115 +----------
+ 16 files changed, 671 insertions(+), 456 deletions(-)
+ create mode 100644 api/v1beta1/flinkcluster_types_util.go
+ create mode 100644 api/v1beta1/flinkcluster_types_util_test.go
+
+diff --git a/api/v1beta1/flinkcluster_default.go b/api/v1beta1/flinkcluster_default.go
+index 744cd0a..e1d419d 100644
+--- a/api/v1beta1/flinkcluster_default.go
++++ b/api/v1beta1/flinkcluster_default.go
+@@ -128,10 +128,6 @@ func _SetJobDefault(jobSpec *JobSpec) {
+ 			AfterJobCancelled: CleanupActionDeleteCluster,
+ 		}
+ 	}
+-	if jobSpec.MaxStateAgeToRestoreSeconds == nil {
+-		jobSpec.MaxStateAgeToRestoreSeconds = new(int32)
+-		*jobSpec.MaxStateAgeToRestoreSeconds = 300
+-	}
+ }
+ 
+ func _SetHadoopConfigDefault(hadoopConfig *HadoopConfig) {
+diff --git a/api/v1beta1/flinkcluster_default_test.go b/api/v1beta1/flinkcluster_default_test.go
+index c4608d1..140866a 100644
+--- a/api/v1beta1/flinkcluster_default_test.go
++++ b/api/v1beta1/flinkcluster_default_test.go
+@@ -53,7 +53,6 @@ func TestSetDefault(t *testing.T) {
+ 	var defaultJobParallelism = int32(1)
+ 	var defaultJobNoLoggingToStdout = false
+ 	var defaultJobRestartPolicy = JobRestartPolicyNever
+-	var defaultMaxStateAgeToRestoreSeconds = int32(300)
+ 	var defaultMemoryOffHeapRatio = int32(25)
+ 	var defaultMemoryOffHeapMin = resource.MustParse("600M")
+ 	var defaultRecreateOnUpdate = true
+@@ -99,11 +98,10 @@ func TestSetDefault(t *testing.T) {
+ 				SecurityContext:    nil,
+ 			},
+ 			Job: &JobSpec{
+-				AllowNonRestoredState:       &defaultJobAllowNonRestoredState,
+-				Parallelism:                 &defaultJobParallelism,
+-				NoLoggingToStdout:           &defaultJobNoLoggingToStdout,
+-				RestartPolicy:               &defaultJobRestartPolicy,
+-				MaxStateAgeToRestoreSeconds: &defaultMaxStateAgeToRestoreSeconds,
++				AllowNonRestoredState: &defaultJobAllowNonRestoredState,
++				Parallelism:           &defaultJobParallelism,
++				NoLoggingToStdout:     &defaultJobNoLoggingToStdout,
++				RestartPolicy:         &defaultJobRestartPolicy,
+ 				CleanupPolicy: &CleanupPolicy{
+ 					AfterJobSucceeds:  "DeleteCluster",
+ 					AfterJobFails:     "KeepCluster",
+@@ -143,7 +141,6 @@ func TestSetNonDefault(t *testing.T) {
+ 	var jobParallelism = int32(2)
+ 	var jobNoLoggingToStdout = true
+ 	var jobRestartPolicy = JobRestartPolicyFromSavepointOnFailure
+-	var jobMaxStateAgeToRestoreSeconds = int32(1000)
+ 	var memoryOffHeapRatio = int32(50)
+ 	var memoryOffHeapMin = resource.MustParse("600M")
+ 	var recreateOnUpdate = false
+@@ -194,12 +191,11 @@ func TestSetNonDefault(t *testing.T) {
+ 				SecurityContext:    &securityContext,
+ 			},
+ 			Job: &JobSpec{
+-				AllowNonRestoredState:       &jobAllowNonRestoredState,
+-				Parallelism:                 &jobParallelism,
+-				NoLoggingToStdout:           &jobNoLoggingToStdout,
+-				RestartPolicy:               &jobRestartPolicy,
+-				MaxStateAgeToRestoreSeconds: &jobMaxStateAgeToRestoreSeconds,
+-				SecurityContext:             &securityContext,
++				AllowNonRestoredState: &jobAllowNonRestoredState,
++				Parallelism:           &jobParallelism,
++				NoLoggingToStdout:     &jobNoLoggingToStdout,
++				RestartPolicy:         &jobRestartPolicy,
++				SecurityContext:       &securityContext,
+ 				CleanupPolicy: &CleanupPolicy{
+ 					AfterJobSucceeds:  "DeleteTaskManagers",
+ 					AfterJobFails:     "DeleteCluster",
+@@ -260,12 +256,11 @@ func TestSetNonDefault(t *testing.T) {
+ 				SecurityContext:    &securityContext,
+ 			},
+ 			Job: &JobSpec{
+-				AllowNonRestoredState:       &jobAllowNonRestoredState,
+-				Parallelism:                 &jobParallelism,
+-				NoLoggingToStdout:           &jobNoLoggingToStdout,
+-				RestartPolicy:               &jobRestartPolicy,
+-				MaxStateAgeToRestoreSeconds: &jobMaxStateAgeToRestoreSeconds,
+-				SecurityContext:             &securityContext,
++				AllowNonRestoredState: &jobAllowNonRestoredState,
++				Parallelism:           &jobParallelism,
++				NoLoggingToStdout:     &jobNoLoggingToStdout,
++				RestartPolicy:         &jobRestartPolicy,
++				SecurityContext:       &securityContext,
+ 				CleanupPolicy: &CleanupPolicy{
+ 					AfterJobSucceeds:  "DeleteTaskManagers",
+ 					AfterJobFails:     "DeleteCluster",
+diff --git a/api/v1beta1/flinkcluster_types.go b/api/v1beta1/flinkcluster_types.go
+index ecd44d0..b7b33f2 100644
+--- a/api/v1beta1/flinkcluster_types.go
++++ b/api/v1beta1/flinkcluster_types.go
+@@ -353,9 +353,14 @@ type JobSpec struct {
+ 	SavepointsDir *string `json:"savepointsDir,omitempty"`
+ 
+ 	// Should take savepoint before updating job, default: true.
++	// If this is set as false, maxStateAgeToRestoreSeconds must be provided to limit the savepoint age to restore.
+ 	TakeSavepointOnUpdate *bool `json:"takeSavepointOnUpdate,omitempty"`
+ 
+-	// Maximum age of the savepoint that a job can be restored when the job is restarted or updated from stopped state, default: 300
++	// Maximum age of the savepoint that allowed to restore state..
++	// This is applied to auto restart on failure, update from stopped state and update without taking savepoint.
++	// If nil, job can be restarted only when the latest savepoint is the final job state (created by "stop with savepoint")
++	// - that is, only when job can be resumed from the suspended state.
++	// +kubebuilder:validation:Minimum=0
+ 	MaxStateAgeToRestoreSeconds *int32 `json:"maxStateAgeToRestoreSeconds,omitempty"`
+ 
+ 	// Automatically take a savepoint to the `savepointsDir` every n seconds.
+@@ -578,7 +583,7 @@ type JobStatus struct {
+ 	// Last successful savepoint completed timestamp.
+ 	SavepointTime string `json:"savepointTime,omitempty"`
+ 
+-	// The savepoint is the final state of the job.
++	// The savepoint recorded in savepointLocation is the final state of the job.
+ 	FinalSavepoint bool `json:"finalSavepoint,omitempty"`
+ 
+ 	// The timestamp of the Flink job deployment that creating job submitter.
+@@ -711,12 +716,3 @@ type FlinkClusterList struct {
+ func init() {
+ 	SchemeBuilder.Register(&FlinkCluster{}, &FlinkClusterList{})
+ }
+-
+-func (j *JobStatus) isJobStopped() bool {
+-	return j != nil &&
+-		(j.State == JobStateSucceeded ||
+-			j.State == JobStateCancelled ||
+-			j.State == JobStateFailed ||
+-			j.State == JobStateLost ||
+-			j.State == JobStateDeployFailed)
+-}
+diff --git a/api/v1beta1/flinkcluster_types_util.go b/api/v1beta1/flinkcluster_types_util.go
+new file mode 100644
+index 0000000..880160f
+--- /dev/null
++++ b/api/v1beta1/flinkcluster_types_util.go
+@@ -0,0 +1,147 @@
++package v1beta1
++
++import (
++	"fmt"
++	"strings"
++	"time"
++)
++
++func (j *JobStatus) IsActive() bool {
++	return j != nil &&
++		(j.State == JobStateRunning || j.State == JobStateDeploying)
++}
++
++func (j *JobStatus) IsPending() bool {
++	return j != nil &&
++		(j.State == JobStatePending ||
++			j.State == JobStateUpdating ||
++			j.State == JobStateRestarting)
++}
++
++func (j *JobStatus) IsFailed() bool {
++	return j != nil &&
++		(j.State == JobStateFailed ||
++			j.State == JobStateLost ||
++			j.State == JobStateDeployFailed)
++}
++
++func (j *JobStatus) IsStopped() bool {
++	return j != nil &&
++		(j.State == JobStateSucceeded ||
++			j.State == JobStateCancelled ||
++			j.State == JobStateFailed ||
++			j.State == JobStateLost ||
++			j.State == JobStateDeployFailed)
++}
++
++func (j *JobStatus) IsTerminated(spec *JobSpec) bool {
++	return j.IsStopped() && !j.ShouldRestart(spec)
++}
++
++// Check if the recorded savepoint is up to date compared to maxStateAgeToRestoreSeconds.
++// If maxStateAgeToRestoreSeconds is not set,
++// the savepoint is up-to-date only when the recorded savepoint is the final job state.
++func (j *JobStatus) IsSavepointUpToDate(spec *JobSpec, compareTime time.Time) bool {
++	if j.FinalSavepoint {
++		return true
++	}
++	if compareTime.IsZero() ||
++		spec.MaxStateAgeToRestoreSeconds == nil ||
++		j.SavepointLocation == "" ||
++		j.SavepointTime == "" {
++		return false
++	}
++
++	var stateMaxAge = int(*spec.MaxStateAgeToRestoreSeconds)
++	if !hasTimeElapsed(j.SavepointTime, compareTime, stateMaxAge) {
++		return true
++	}
++	return false
++}
++
++// shouldRestartJob returns true if the controller should restart failed job.
++// The controller can restart the job only if there is a savepoint that is close to the end time of the job.
++func (j *JobStatus) ShouldRestart(spec *JobSpec) bool {
++	if j == nil || !j.IsFailed() || spec == nil {
++		return false
++	}
++	var tc TimeConverter
++	var restartEnabled = spec.RestartPolicy != nil && *spec.RestartPolicy == JobRestartPolicyFromSavepointOnFailure
++	var jobEndTime = tc.FromString(j.EndTime)
++	return restartEnabled && j.IsSavepointUpToDate(spec, jobEndTime)
++}
++
++// Return true if job is ready to proceed update.
++func (j *JobStatus) UpdateReady(spec *JobSpec, observeTime time.Time) bool {
++	var takeSavepointOnUpdate = spec.TakeSavepointOnUpdate == nil || *spec.TakeSavepointOnUpdate
++	switch {
++	case j == nil:
++		fallthrough
++	case !isBlank(spec.FromSavepoint):
++		return true
++	case j.IsActive():
++		// When job is active and takeSavepointOnUpdate is true, only after taking savepoint with final job state,
++		// proceed job update.
++		if takeSavepointOnUpdate {
++			if j.FinalSavepoint {
++				return true
++			}
++		} else if j.IsSavepointUpToDate(spec, observeTime) {
++			return true
++		}
++	case j.State == JobStateUpdating && !takeSavepointOnUpdate:
++		return true
++	default:
++		// In other cases, check if savepoint is up-to-date compared to job end time.
++		var tc = TimeConverter{}
++		var jobEndTime time.Time
++		if j.EndTime != "" {
++			jobEndTime = tc.FromString(j.EndTime)
++		}
++		if j.IsSavepointUpToDate(spec, jobEndTime) {
++			return true
++		}
++	}
++	return false
++}
++
++func (s *SavepointStatus) IsFailed() bool {
++	return s != nil && (s.State == SavepointStateTriggerFailed || s.State == SavepointStateFailed)
++}
++
++func (r *RevisionStatus) IsUpdateTriggered() bool {
++	return r.CurrentRevision != r.NextRevision
++}
++
++// TimeConverter converts between time.Time and string.
++type TimeConverter struct{}
++
++// FromString converts string to time.Time.
++func (tc *TimeConverter) FromString(timeStr string) time.Time {
++	timestamp, err := time.Parse(
++		time.RFC3339, timeStr)
++	if err != nil {
++		panic(fmt.Sprintf("Failed to parse time string: %s", timeStr))
++	}
++	return timestamp
++}
++
++// ToString converts time.Time to string.
++func (tc *TimeConverter) ToString(timestamp time.Time) string {
++	return timestamp.Format(time.RFC3339)
++}
++
++// Check time has passed
++func hasTimeElapsed(timeToCheckStr string, now time.Time, intervalSec int) bool {
++	tc := &TimeConverter{}
++	timeToCheck := tc.FromString(timeToCheckStr)
++	intervalPassedTime := timeToCheck.Add(time.Duration(int64(intervalSec) * int64(time.Second)))
++	if now.After(intervalPassedTime) {
++		return true
++	}
++	return false
++}
++
++func isBlank(s *string) bool {
++	return s == nil || strings.TrimSpace(*s) == ""
++}
+diff --git a/api/v1beta1/flinkcluster_types_util_test.go b/api/v1beta1/flinkcluster_types_util_test.go
+new file mode 100644
+index 0000000..1052e5f
+--- /dev/null
++++ b/api/v1beta1/flinkcluster_types_util_test.go
+@@ -0,0 +1,154 @@
++/*
++Copyright 2019 Google LLC.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package v1beta1
++
++import (
++	"gotest.tools/assert"
++	"testing"
++	"time"
++)
++
++func TestIsSavepointUpToDate(t *testing.T) {
++	var tc = &TimeConverter{}
++	var savepointTime = time.Now()
++	var jobEndTime = savepointTime.Add(time.Second * 100)
++	var maxStateAgeToRestoreSeconds = int32(300)
++
++	// When maxStateAgeToRestoreSeconds is not provided
++	var jobSpec = JobSpec{
++		MaxStateAgeToRestoreSeconds: nil,
++	}
++	var jobStatus = JobStatus{
++		SavepointTime:     tc.ToString(savepointTime),
++		SavepointLocation: "gs://my-bucket/savepoint-123",
++	}
++	var update = jobStatus.IsSavepointUpToDate(&jobSpec, jobEndTime)
++	assert.Equal(t, update, false)
++
++	// Old savepoint
++	savepointTime = time.Now()
++	jobEndTime = savepointTime.Add(time.Second * 500)
++	jobSpec = JobSpec{
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	jobStatus = JobStatus{
++		SavepointTime:     tc.ToString(savepointTime),
++		SavepointLocation: "gs://my-bucket/savepoint-123",
++		EndTime:           tc.ToString(jobEndTime),
++	}
++	update = jobStatus.IsSavepointUpToDate(&jobSpec, jobEndTime)
++	assert.Equal(t, update, false)
++
++	// Fails without savepointLocation
++	savepointTime = time.Now()
++	jobEndTime = savepointTime.Add(time.Second * 100)
++	jobSpec = JobSpec{
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	jobStatus = JobStatus{
++		SavepointTime: tc.ToString(savepointTime),
++		EndTime:       tc.ToString(jobEndTime),
++	}
++	update = jobStatus.IsSavepointUpToDate(&jobSpec, jobEndTime)
++	assert.Equal(t, update, false)
++
++	// Up-to-date savepoint
++	jobEndTime = savepointTime.Add(time.Second * 100)
++	jobSpec = JobSpec{
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	jobStatus = JobStatus{
++		SavepointTime:     tc.ToString(savepointTime),
++		SavepointLocation: "gs://my-bucket/savepoint-123",
++	}
++	update = jobStatus.IsSavepointUpToDate(&jobSpec, jobEndTime)
++	assert.Equal(t, update, true)
++
++	// A savepoint of the final job state.
++	jobSpec = JobSpec{
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	jobStatus = JobStatus{
++		FinalSavepoint: true,
++	}
++	update = jobStatus.IsSavepointUpToDate(&jobSpec, time.Time{})
++	assert.Equal(t, update, true)
++}
++
++func TestShouldRestartJob(t *testing.T) {
++	var tc = &TimeConverter{}
++	var restartOnFailure = JobRestartPolicyFromSavepointOnFailure
++	var neverRestart = JobRestartPolicyNever
++	var maxStateAgeToRestoreSeconds = int32(300) // 5 min
++
++	// Restart with savepoint up to date
++	var savepointTime = time.Now()
++	var endTime = savepointTime.Add(time.Second * 60) // savepointTime + 1 min
++	var jobSpec = JobSpec{
++		RestartPolicy:               &restartOnFailure,
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	var jobStatus = JobStatus{
++		State:             JobStateFailed,
++		SavepointLocation: "gs://my-bucket/savepoint-123",
++		SavepointTime:     tc.ToString(savepointTime),
++		EndTime:           tc.ToString(endTime),
++	}
++	var restart = jobStatus.ShouldRestart(&jobSpec)
++	assert.Equal(t, restart, true)
++
++	// Not restart without savepoint
++	jobSpec = JobSpec{
++		RestartPolicy:               &restartOnFailure,
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	jobStatus = JobStatus{
++		State:   JobStateFailed,
++		EndTime: tc.ToString(endTime),
++	}
++	restart = jobStatus.ShouldRestart(&jobSpec)
++	assert.Equal(t, restart, false)
++
++	// Not restart with restartPolicy Never
++	jobSpec = JobSpec{
++		RestartPolicy:               &neverRestart,
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	jobStatus = JobStatus{
++		State:             JobStateFailed,
++		SavepointLocation: "gs://my-bucket/savepoint-123",
++		SavepointTime:     tc.ToString(savepointTime),
++		EndTime:           tc.ToString(endTime),
++	}
++	restart = jobStatus.ShouldRestart(&jobSpec)
++	assert.Equal(t, restart, false)
++
++	// Not restart with old savepoint
++	endTime = savepointTime.Add(time.Second * 300) // savepointTime + 5 min
++	jobSpec = JobSpec{
++		RestartPolicy:               &neverRestart,
++		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++	}
++	jobStatus = JobStatus{
++		State:             JobStateFailed,
++		SavepointLocation: "gs://my-bucket/savepoint-123",
++		SavepointTime:     tc.ToString(savepointTime),
++		EndTime:           tc.ToString(endTime),
++	}
++	restart = jobStatus.ShouldRestart(&jobSpec)
++	assert.Equal(t, restart, false)
++}
+diff --git a/api/v1beta1/flinkcluster_validate.go b/api/v1beta1/flinkcluster_validate.go
+index 2a35388..d7072e5 100644
+--- a/api/v1beta1/flinkcluster_validate.go
++++ b/api/v1beta1/flinkcluster_validate.go
+@@ -20,7 +20,9 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"reflect"
++	"strconv"
+ 	"strings"
++	"time"
+ 
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 
+@@ -82,6 +84,11 @@ func (v *Validator) ValidateUpdate(old *FlinkCluster, new *FlinkCluster) error {
+ 		return err
+ 	}
+ 
++	// Skip remaining validation if no changes in spec.
++	if reflect.DeepEqual(new.Spec, old.Spec) {
++		return nil
++	}
++
+ 	cancelRequested, err := v.checkCancelRequested(old, new)
+ 	if err != nil {
+ 		return err
+@@ -120,19 +127,19 @@ func (v *Validator) checkControlAnnotations(old *FlinkCluster, new *FlinkCluster
+ 		}
+ 		switch newUserControl {
+ 		case ControlNameJobCancel:
+-			var jobStatus = old.Status.Components.Job
++			var job = old.Status.Components.Job
+ 			if old.Spec.Job == nil {
+ 				return fmt.Errorf(SessionClusterWarnMsg, ControlNameJobCancel, ControlAnnotation)
+-			} else if jobStatus == nil || isJobTerminated(old.Spec.Job.RestartPolicy, jobStatus) {
++			} else if job == nil || job.IsTerminated(old.Spec.Job) {
+ 				return fmt.Errorf(InvalidJobStateForJobCancelMsg, ControlAnnotation)
+ 			}
+ 		case ControlNameSavepoint:
+-			var jobStatus = old.Status.Components.Job
++			var job = old.Status.Components.Job
+ 			if old.Spec.Job == nil {
+ 				return fmt.Errorf(SessionClusterWarnMsg, ControlNameSavepoint, ControlAnnotation)
+ 			} else if old.Spec.Job.SavepointsDir == nil || *old.Spec.Job.SavepointsDir == "" {
+ 				return fmt.Errorf(InvalidSavepointDirMsg, ControlAnnotation)
+-			} else if jobStatus == nil || jobStatus.isJobStopped() {
++			} else if job == nil || job.IsStopped() {
+ 				return fmt.Errorf(InvalidJobStateForSavepointMsg, ControlAnnotation)
+ 			}
+ 		default:
+@@ -207,28 +214,42 @@ func (v *Validator) checkSavepointGeneration(
+ 
+ // Validate job update.
+ func (v *Validator) validateJobUpdate(old *FlinkCluster, new *FlinkCluster) error {
+-	var jobStatus = old.Status.Components.Job
+ 	switch {
+ 	case old.Spec.Job == nil && new.Spec.Job == nil:
+ 		return nil
+ 	case old.Spec.Job == nil || new.Spec.Job == nil:
+-		oldJob, _ := json.Marshal(old.Spec.Job)
+-		newJob, _ := json.Marshal(new.Spec.Job)
+-		return fmt.Errorf("you cannot change cluster type between session cluster and job cluster, old spec.job: %q, new spec.job: %q", oldJob, newJob)
++		oldJobSpec, _ := json.Marshal(old.Spec.Job)
++		newJobSpec, _ := json.Marshal(new.Spec.Job)
++		return fmt.Errorf("you cannot change cluster type between session cluster and job cluster, old spec.job: %q, new spec.job: %q", oldJobSpec, newJobSpec)
+ 	case old.Spec.Job.SavepointsDir == nil || *old.Spec.Job.SavepointsDir == "":
+ 		return fmt.Errorf("updating job is not allowed when spec.job.savepointsDir was not provided")
+ 	case old.Spec.Job.SavepointsDir != nil && *old.Spec.Job.SavepointsDir != "" &&
+ 		(new.Spec.Job.SavepointsDir == nil || *new.Spec.Job.SavepointsDir == ""):
+ 		return fmt.Errorf("removing savepointsDir is not allowed")
+-	case jobStatus != nil && jobStatus.isJobStopped():
+-		if jobStatus.FinalSavepoint {
+-			return nil
+-		}
+-		var shouldTakeSavepoint = (new.Spec.Job.TakeSavepointOnUpdate == nil || *new.Spec.Job.TakeSavepointOnUpdate) &&
+-			(new.Spec.Job.FromSavepoint == nil || *new.Spec.Job.FromSavepoint == "")
+-		if shouldTakeSavepoint {
+-			return fmt.Errorf("cannot update because job is stoppped without final savepoint," +
+-				"to proceed update, you need to set takeSavepointOnUpdate false or provide fromSavepoint")
++	case !isBlank(new.Spec.Job.FromSavepoint):
++		return nil
++	default:
++		// In the case of taking savepoint is skipped, check if the savepoint is up-to-date.
++		var oldJob = old.Status.Components.Job
++		var takeSavepointOnUpdate = new.Spec.Job.TakeSavepointOnUpdate == nil || *new.Spec.Job.TakeSavepointOnUpdate
++		var skipTakeSavepoint = !takeSavepointOnUpdate || oldJob.IsStopped()
++		var now = time.Now()
++		if skipTakeSavepoint && oldJob != nil && !oldJob.UpdateReady(new.Spec.Job, now) {
++			oldJobJson, _ := json.Marshal(oldJob)
++			var takeSP, maxStateAge string
++			if new.Spec.Job.TakeSavepointOnUpdate == nil {
++				takeSP = "nil"
++			} else {
++				takeSP = strconv.FormatBool(*new.Spec.Job.TakeSavepointOnUpdate)
++			}
++			if new.Spec.Job.MaxStateAgeToRestoreSeconds == nil {
++				maxStateAge = "nil"
++			} else {
++				maxStateAge = strconv.Itoa(int(*new.Spec.Job.MaxStateAgeToRestoreSeconds))
++			}
++			return fmt.Errorf("cannot update spec: taking savepoint is skipped but no up-to-date savepoint, "+
++				"spec.job.takeSavepointOnUpdate: %v, spec.job.maxStateAgeToRestoreSeconds: %v, job status: %q",
++				takeSP, maxStateAge, oldJobJson)
+ 		}
+ 	}
+ 	return nil
+@@ -424,10 +445,18 @@ func (v *Validator) validateJob(jobSpec *JobSpec) error {
+ 	switch *jobSpec.RestartPolicy {
+ 	case JobRestartPolicyNever:
+ 	case JobRestartPolicyFromSavepointOnFailure:
++		if jobSpec.MaxStateAgeToRestoreSeconds == nil {
++			return fmt.Errorf("maxStateAgeToRestoreSeconds must be specified when restartPolicy is set as FromSavepointOnFailure")
++		}
+ 	default:
+ 		return fmt.Errorf("invalid job restartPolicy: %v", *jobSpec.RestartPolicy)
+ 	}
+ 
++	if jobSpec.TakeSavepointOnUpdate != nil && *jobSpec.TakeSavepointOnUpdate == false &&
++		jobSpec.MaxStateAgeToRestoreSeconds == nil {
++		return fmt.Errorf("maxStateAgeToRestoreSeconds must be specified when takeSavepointOnUpdate is set as false")
++	}
++
+ 	if jobSpec.CleanupPolicy == nil {
+ 		return fmt.Errorf("job cleanupPolicy is unspecified")
+ 	}
+@@ -518,19 +547,3 @@ func (v *Validator) validateMemoryOffHeapMin(
+ 	}
+ 	return nil
+ }
+-
+-// shouldRestartJob returns true if the controller should restart the failed
+-// job.
+-func shouldRestartJob(
+-	restartPolicy *JobRestartPolicy,
+-	jobStatus *JobStatus) bool {
+-	return restartPolicy != nil &&
+-		*restartPolicy == JobRestartPolicyFromSavepointOnFailure &&
+-		jobStatus != nil &&
+-		jobStatus.State == JobStateFailed &&
+-		len(jobStatus.SavepointLocation) > 0
+-}
+-
+-func isJobTerminated(restartPolicy *JobRestartPolicy, jobStatus *JobStatus) bool {
+-	return jobStatus.isJobStopped() && !shouldRestartJob(restartPolicy, jobStatus)
+-}
+diff --git a/api/v1beta1/flinkcluster_validate_test.go b/api/v1beta1/flinkcluster_validate_test.go
+index 4319a06..9c2f5a7 100644
+--- a/api/v1beta1/flinkcluster_validate_test.go
++++ b/api/v1beta1/flinkcluster_validate_test.go
+@@ -20,6 +20,7 @@ import (
+ 	"encoding/json"
+ 	"fmt"
+ 	"testing"
++	"time"
+ 
+ 	"k8s.io/apimachinery/pkg/api/resource"
+ 
+@@ -28,6 +29,8 @@ import (
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ )
+ 
++const MaxStateAgeToRestore = int32(60)
++
+ func TestValidateCreate(t *testing.T) {
+ 	var jmReplicas int32 = 1
+ 	var rpcPort int32 = 8001
+@@ -36,6 +39,7 @@ func TestValidateCreate(t *testing.T) {
+ 	var uiPort int32 = 8004
+ 	var dataPort int32 = 8005
+ 	var parallelism int32 = 2
++	var maxStateAgeToRestoreSeconds = int32(60)
+ 	var restartPolicy = JobRestartPolicyFromSavepointOnFailure
+ 	var memoryOffHeapRatio int32 = 25
+ 	var memoryOffHeapMin = resource.MustParse("600M")
+@@ -72,9 +76,10 @@ func TestValidateCreate(t *testing.T) {
+ 				MemoryOffHeapMin:   memoryOffHeapMin,
+ 			},
+ 			Job: &JobSpec{
+-				JarFile:       "gs://my-bucket/myjob.jar",
+-				Parallelism:   &parallelism,
+-				RestartPolicy: &restartPolicy,
++				JarFile:                     "gs://my-bucket/myjob.jar",
++				Parallelism:                 &parallelism,
++				MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
++				RestartPolicy:               &restartPolicy,
+ 				CleanupPolicy: &CleanupPolicy{
+ 					AfterJobSucceeds: CleanupActionKeepCluster,
+ 					AfterJobFails:    CleanupActionDeleteTaskManager,
+@@ -353,6 +358,7 @@ func TestInvalidJobSpec(t *testing.T) {
+ 	var queryPort int32 = 8003
+ 	var uiPort int32 = 8004
+ 	var dataPort int32 = 8005
++	var maxStateAgeToRestoreSeconds int32 = 300
+ 	var restartPolicy = JobRestartPolicyFromSavepointOnFailure
+ 	var invalidRestartPolicy JobRestartPolicy = "XXX"
+ 	var validator = &Validator{}
+@@ -393,8 +399,9 @@ func TestInvalidJobSpec(t *testing.T) {
+ 				MemoryOffHeapMin:   memoryOffHeapMin,
+ 			},
+ 			Job: &JobSpec{
+-				JarFile:       "",
+-				RestartPolicy: &restartPolicy,
++				JarFile:                     "",
++				RestartPolicy:               &restartPolicy,
++				MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+ 			},
+ 		},
+ 	}
+@@ -435,8 +442,9 @@ func TestInvalidJobSpec(t *testing.T) {
+ 				MemoryOffHeapMin:   memoryOffHeapMin,
+ 			},
+ 			Job: &JobSpec{
+-				JarFile:       "gs://my-bucket/myjob.jar",
+-				RestartPolicy: &restartPolicy,
++				JarFile:                     "gs://my-bucket/myjob.jar",
++				RestartPolicy:               &restartPolicy,
++				MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+ 			},
+ 		},
+ 	}
+@@ -477,9 +485,10 @@ func TestInvalidJobSpec(t *testing.T) {
+ 				MemoryOffHeapMin:   memoryOffHeapMin,
+ 			},
+ 			Job: &JobSpec{
+-				JarFile:       "gs://my-bucket/myjob.jar",
+-				Parallelism:   &parallelism,
+-				RestartPolicy: &invalidRestartPolicy,
++				JarFile:                     "gs://my-bucket/myjob.jar",
++				Parallelism:                 &parallelism,
++				RestartPolicy:               &invalidRestartPolicy,
++				MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+ 			},
+ 		},
+ 	}
+@@ -520,9 +529,10 @@ func TestInvalidJobSpec(t *testing.T) {
+ 				MemoryOffHeapMin:   memoryOffHeapMin,
+ 			},
+ 			Job: &JobSpec{
+-				JarFile:       "gs://my-bucket/myjob.jar",
+-				Parallelism:   &parallelism,
+-				RestartPolicy: &restartPolicy,
++				JarFile:                     "gs://my-bucket/myjob.jar",
++				Parallelism:                 &parallelism,
++				RestartPolicy:               &restartPolicy,
++				MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+ 				CleanupPolicy: &CleanupPolicy{
+ 					AfterJobSucceeds: "XXX",
+ 					AfterJobFails:    CleanupActionDeleteCluster,
+@@ -618,47 +628,19 @@ func TestUpdateSavepointGeneration(t *testing.T) {
+ 
+ func TestUpdateJob(t *testing.T) {
+ 	var validator = &Validator{}
+-	var parallelism int32 = 2
+-	var restartPolicy = JobRestartPolicyFromSavepointOnFailure
+-	var savepointDir = "/savepoint_dir"
++	var tc = &TimeConverter{}
++	var maxStateAge = time.Duration(MaxStateAgeToRestore)
+ 
+-	oldCluster := getSimpleFlinkCluster()
+-	oldCluster.Spec.Job = &JobSpec{
+-		JarFile:       "gs://my-bucket/myjob.jar",
+-		Parallelism:   &parallelism,
+-		RestartPolicy: &restartPolicy,
+-		SavepointsDir: &savepointDir,
+-		CleanupPolicy: &CleanupPolicy{
+-			AfterJobSucceeds: CleanupActionKeepCluster,
+-			AfterJobFails:    CleanupActionDeleteTaskManager,
+-		},
+-	}
+-	newCluster := getSimpleFlinkCluster()
+-	newCluster.Spec.Job = &JobSpec{
+-		JarFile:       "gs://my-bucket/myjob.jar",
+-		Parallelism:   &parallelism,
+-		RestartPolicy: &restartPolicy,
+-		SavepointsDir: nil,
+-		CleanupPolicy: &CleanupPolicy{
+-			AfterJobSucceeds: CleanupActionKeepCluster,
+-			AfterJobFails:    CleanupActionDeleteTaskManager,
+-		},
+-	}
++	// cannot remove savepointsDir
++	var oldCluster = getSimpleFlinkCluster()
++	var newCluster = getSimpleFlinkCluster()
++	newCluster.Spec.Job.SavepointsDir = nil
+ 	err := validator.ValidateUpdate(&oldCluster, &newCluster)
+ 	expectedErr := "removing savepointsDir is not allowed"
+ 	assert.Equal(t, err.Error(), expectedErr)
+ 
++	// cannot change cluster type
+ 	oldCluster = getSimpleFlinkCluster()
+-	oldCluster.Spec.Job = &JobSpec{
+-		JarFile:       "gs://my-bucket/myjob.jar",
+-		Parallelism:   &parallelism,
+-		RestartPolicy: &restartPolicy,
+-		SavepointsDir: &savepointDir,
+-		CleanupPolicy: &CleanupPolicy{
+-			AfterJobSucceeds: CleanupActionKeepCluster,
+-			AfterJobFails:    CleanupActionDeleteTaskManager,
+-		},
+-	}
+ 	newCluster = getSimpleFlinkCluster()
+ 	newCluster.Spec.Job = nil
+ 	err = validator.ValidateUpdate(&oldCluster, &newCluster)
+@@ -667,29 +649,111 @@ func TestUpdateJob(t *testing.T) {
+ 	expectedErr = fmt.Sprintf("you cannot change cluster type between session cluster and job cluster, old spec.job: %q, new spec.job: %q", oldJson, newJson)
+ 	assert.Equal(t, err.Error(), expectedErr)
+ 
++	// cannot update when savepointDir is not provided
+ 	oldCluster = getSimpleFlinkCluster()
+-	oldCluster.Spec.Job = &JobSpec{
+-		JarFile:       "gs://my-bucket/myjob-v1.jar",
+-		Parallelism:   &parallelism,
+-		RestartPolicy: &restartPolicy,
+-		CleanupPolicy: &CleanupPolicy{
+-			AfterJobSucceeds: CleanupActionKeepCluster,
+-			AfterJobFails:    CleanupActionDeleteTaskManager,
+-		},
++	oldCluster.Spec.Job.SavepointsDir = nil
++	newCluster = getSimpleFlinkCluster()
++	newCluster.Spec.Job.SavepointsDir = nil
++	newCluster.Spec.Job.JarFile = "gs://my-bucket/myjob-v2.jar"
++	err = validator.ValidateUpdate(&oldCluster, &newCluster)
++	expectedErr = "updating job is not allowed when spec.job.savepointsDir was not provided"
++	assert.Equal(t, err.Error(), expectedErr)
++
++	// cannot update when takeSavepointOnUpdate is false and stale savepoint
++	var takeSavepointOnUpdateFalse = false
++	var savepointTime = time.Now().Add(-(maxStateAge + 10) * time.Second) // stale savepoint
++	oldCluster = getSimpleFlinkCluster()
++	oldCluster.Status.Components.Job = &JobStatus{
++		SavepointTime:     tc.ToString(savepointTime),
++		SavepointLocation: "gs://my-bucket/my-sp-123",
++		State:             JobStateRunning,
+ 	}
+ 	newCluster = getSimpleFlinkCluster()
+-	newCluster.Spec.Job = &JobSpec{
+-		JarFile:       "gs://my-bucket/myjob-v2.jar",
+-		Parallelism:   &parallelism,
+-		RestartPolicy: &restartPolicy,
+-		CleanupPolicy: &CleanupPolicy{
+-			AfterJobSucceeds: CleanupActionKeepCluster,
+-			AfterJobFails:    CleanupActionDeleteTaskManager,
+-		},
++	newCluster.Spec.Job.JarFile = "gs://my-bucket/myjob-v2.jar"
++	newCluster.Spec.Job.TakeSavepointOnUpdate = &takeSavepointOnUpdateFalse
++	err = validator.ValidateUpdate(&oldCluster, &newCluster)
++	jobStatusJson, _ := json.Marshal(oldCluster.Status.Components.Job)
++	expectedErr = fmt.Sprintf("cannot update spec: taking savepoint is skipped but no up-to-date savepoint, "+
++		"spec.job.takeSavepointOnUpdate: false, spec.job.maxStateAgeToRestoreSeconds: 60, job status: %q", jobStatusJson)
++	assert.Equal(t, err.Error(), expectedErr)
++
++	// update when takeSavepointOnUpdate is false and savepoint is up-to-date
++	takeSavepointOnUpdateFalse = false
++	maxStateAge = time.Duration(*getSimpleFlinkCluster().Spec.Job.MaxStateAgeToRestoreSeconds)
++	savepointTime = time.Now().Add(-(maxStateAge - 10) * time.Second) // up-to-date savepoint
++	oldCluster = getSimpleFlinkCluster()
++	oldCluster.Status.Components.Job = &JobStatus{
++		SavepointTime:     tc.ToString(savepointTime),
++		SavepointLocation: "gs://my-bucket/my-sp-123",
++		State:             JobStateRunning,
+ 	}
++	newCluster = getSimpleFlinkCluster()
++	newCluster.Spec.Job.JarFile = "gs://my-bucket/myjob-v2.jar"
++	newCluster.Spec.Job.TakeSavepointOnUpdate = &takeSavepointOnUpdateFalse
+ 	err = validator.ValidateUpdate(&oldCluster, &newCluster)
+-	expectedErr = "updating job is not allowed when spec.job.savepointsDir was not provided"
++	assert.Equal(t, err, nil)
++
++	// spec update is allowed when takeSavepointOnUpdate is true and savepoint is not completed yet
++	oldCluster = getSimpleFlinkCluster()
++	oldCluster.Status.Components.Job = &JobStatus{
++		FinalSavepoint:    false,
++		SavepointLocation: "gs://my-bucket/my-sp-123",
++		State:             JobStateRunning,
++	}
++	newCluster = getSimpleFlinkCluster()
++	newCluster.Spec.Job.JarFile = "gs://my-bucket/myjob-v2.jar"
++	err = validator.ValidateUpdate(&oldCluster, &newCluster)
++	assert.Equal(t, err, nil)
++
++	// when job is stopped and no up-to-date savepoint
++	var jobEndTime = time.Now()
++	savepointTime = jobEndTime.Add(-(maxStateAge + 10) * time.Second) // stale savepoint
++	oldCluster = getSimpleFlinkCluster()
++	oldCluster.Status.Components.Job = &JobStatus{
++		SavepointTime:     tc.ToString(savepointTime),
++		SavepointLocation: "gs://my-bucket/my-sp-123",
++		State:             JobStateFailed,
++		EndTime:           tc.ToString(jobEndTime),
++	}
++	newCluster = getSimpleFlinkCluster()
++	newCluster.Spec.Job.JarFile = "gs://my-bucket/myjob-v2.jar"
++	err = validator.ValidateUpdate(&oldCluster, &newCluster)
++	jobStatusJson, _ = json.Marshal(oldCluster.Status.Components.Job)
++	expectedErr = fmt.Sprintf("cannot update spec: taking savepoint is skipped but no up-to-date savepoint, "+
++		"spec.job.takeSavepointOnUpdate: nil, spec.job.maxStateAgeToRestoreSeconds: 60, job status: %q", jobStatusJson)
+ 	assert.Equal(t, err.Error(), expectedErr)
++
++	// when job is stopped and savepoint is up-to-date
++	jobEndTime = time.Now()
++	savepointTime = jobEndTime.Add(-(maxStateAge - 10) * time.Second) // up-to-date savepoint
++	oldCluster = getSimpleFlinkCluster()
++	oldCluster.Status.Components.Job = &JobStatus{
++		SavepointTime:     tc.ToString(savepointTime),
++		SavepointLocation: "gs://my-bucket/my-sp-123",
++		State:             JobStateFailed,
++		EndTime:           tc.ToString(jobEndTime),
++	}
++	newCluster = getSimpleFlinkCluster()
++	newCluster.Spec.Job.JarFile = "gs://my-bucket/myjob-v2.jar"
++	err = validator.ValidateUpdate(&oldCluster, &newCluster)
++	assert.Equal(t, err, nil)
++
++	// when job is stopped and savepoint is stale, but fromSavepoint is provided
++	var fromSavepoint = "gs://my-bucket/sp-123"
++	jobEndTime = time.Now()
++	savepointTime = jobEndTime.Add(-(maxStateAge + 10) * time.Second) // stale savepoint
++	oldCluster = getSimpleFlinkCluster()
++	oldCluster.Status.Components.Job = &JobStatus{
++		SavepointTime:     tc.ToString(savepointTime),
++		SavepointLocation: "gs://my-bucket/my-sp-123",
++		State:             JobStateFailed,
++		EndTime:           tc.ToString(jobEndTime),
++	}
++	newCluster = getSimpleFlinkCluster()
++	newCluster.Spec.Job.JarFile = "gs://my-bucket/myjob-v2.jar"
++	newCluster.Spec.Job.FromSavepoint = &fromSavepoint
++	err = validator.ValidateUpdate(&oldCluster, &newCluster)
++	assert.Equal(t, err, nil)
+ }
+ 
+ func TestUpdateCluster(t *testing.T) {
+@@ -852,6 +916,7 @@ func TestUserControlSavepoint(t *testing.T) {
+ }
+ 
+ func TestUserControlJobCancel(t *testing.T) {
++	var tc = TimeConverter{}
+ 	var validator = &Validator{}
+ 	var restartPolicy = JobRestartPolicyNever
+ 	var newCluster = FlinkCluster{
+@@ -881,16 +946,22 @@ func TestUserControlJobCancel(t *testing.T) {
+ 	assert.Equal(t, err3.Error(), expectedErr3)
+ 
+ 	var oldCluster4 = FlinkCluster{
+-		Spec:   FlinkClusterSpec{Job: &JobSpec{}},
+-		Status: FlinkClusterStatus{Components: FlinkClusterComponentsStatus{Job: &JobStatus{State: JobStateSucceeded}}},
++		Spec: FlinkClusterSpec{Job: &JobSpec{}},
++		Status: FlinkClusterStatus{Components: FlinkClusterComponentsStatus{Job: &JobStatus{
++			State:   JobStateSucceeded,
++			EndTime: tc.ToString(time.Now()),
++		}}},
+ 	}
+ 	var err4 = validator.ValidateUpdate(&oldCluster4, &newCluster)
+ 	var expectedErr4 = "job-cancel is not allowed because job is not started yet or already terminated, annotation: flinkclusters.flinkoperator.k8s.io/user-control"
+ 	assert.Equal(t, err4.Error(), expectedErr4)
+ 
+ 	var oldCluster5 = FlinkCluster{
+-		Spec:   FlinkClusterSpec{Job: &JobSpec{RestartPolicy: &restartPolicy}},
+-		Status: FlinkClusterStatus{Components: FlinkClusterComponentsStatus{Job: &JobStatus{State: JobStateFailed}}},
++		Spec: FlinkClusterSpec{Job: &JobSpec{RestartPolicy: &restartPolicy}},
++		Status: FlinkClusterStatus{Components: FlinkClusterComponentsStatus{
++			Job: &JobStatus{State: JobStateFailed,
++				EndTime: tc.ToString(time.Now()),
++			}}},
+ 	}
+ 	var err5 = validator.ValidateUpdate(&oldCluster5, &newCluster)
+ 	var expectedErr5 = "job-cancel is not allowed because job is not started yet or already terminated, annotation: flinkclusters.flinkoperator.k8s.io/user-control"
+@@ -965,6 +1036,7 @@ func getSimpleFlinkCluster() FlinkCluster {
+ 	var memoryOffHeapRatio int32 = 25
+ 	var memoryOffHeapMin = resource.MustParse("600M")
+ 	var parallelism int32 = 2
++	var maxStateAge = MaxStateAgeToRestore
+ 	var restartPolicy = JobRestartPolicyFromSavepointOnFailure
+ 	var savepointDir = "/savepoint_dir"
+ 	return FlinkCluster{
+@@ -1000,10 +1072,11 @@ func getSimpleFlinkCluster() FlinkCluster {
+ 				MemoryOffHeapMin:   memoryOffHeapMin,
+ 			},
+ 			Job: &JobSpec{
+-				JarFile:       "gs://my-bucket/myjob.jar",
+-				Parallelism:   &parallelism,
+-				RestartPolicy: &restartPolicy,
+-				SavepointsDir: &savepointDir,
++				JarFile:                     "gs://my-bucket/myjob.jar",
++				Parallelism:                 &parallelism,
++				MaxStateAgeToRestoreSeconds: &maxStateAge,
++				RestartPolicy:               &restartPolicy,
++				SavepointsDir:               &savepointDir,
+ 				CleanupPolicy: &CleanupPolicy{
+ 					AfterJobSucceeds: CleanupActionKeepCluster,
+ 					AfterJobFails:    CleanupActionDeleteTaskManager,
+diff --git a/api/v1beta1/zz_generated.deepcopy.go b/api/v1beta1/zz_generated.deepcopy.go
+index 93e8f5a..25b579e 100644
+--- a/api/v1beta1/zz_generated.deepcopy.go
++++ b/api/v1beta1/zz_generated.deepcopy.go
+@@ -869,6 +869,21 @@ func (in *TaskManagerSpec) DeepCopy() *TaskManagerSpec {
+ }
+ 
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *TimeConverter) DeepCopyInto(out *TimeConverter) {
++	*out = *in
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new TimeConverter.
++func (in *TimeConverter) DeepCopy() *TimeConverter {
++	if in == nil {
++		return nil
++	}
++	out := new(TimeConverter)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *Validator) DeepCopyInto(out *Validator) {
+ 	*out = *in
+ }
+diff --git a/config/crd/bases/flinkoperator.k8s.io_flinkclusters.yaml b/config/crd/bases/flinkoperator.k8s.io_flinkclusters.yaml
+index 36e67f0..f0474f3 100644
+--- a/config/crd/bases/flinkoperator.k8s.io_flinkclusters.yaml
++++ b/config/crd/bases/flinkoperator.k8s.io_flinkclusters.yaml
+@@ -716,6 +716,7 @@ spec:
+                   type: string
+                 maxStateAgeToRestoreSeconds:
+                   format: int32
++                  minimum: 0
+                   type: integer
+                 noLoggingToStdout:
+                   type: boolean
+diff --git a/controllers/flinkcluster_converter.go b/controllers/flinkcluster_converter.go
+index fa47431..96cb42d 100644
+--- a/controllers/flinkcluster_converter.go
++++ b/controllers/flinkcluster_converter.go
+@@ -603,8 +603,8 @@ func getDesiredJob(observed *ObservedClusterState) *batchv1.Job {
+ 	}
+ 
+ 	// When the job should be stopped, keep that state unless update is triggered or the job must to be restarted.
+-	if (shouldStopJob(flinkCluster) || isJobStopped(jobStatus)) &&
+-		!(observed.isClusterUpdating() || shouldRestartJob(jobSpec, jobStatus)) {
++	if (shouldStopJob(flinkCluster) || jobStatus.IsStopped()) &&
++		!(shouldUpdateJob(observed) || jobStatus.ShouldRestart(jobSpec)) {
+ 		return nil
+ 	}
+ 
+@@ -779,7 +779,7 @@ func convertFromSavepoint(jobSpec *v1beta1.JobSpec, jobStatus *v1beta1.JobStatus
+ 		}
+ 		return nil
+ 	// Updating with FromSavepoint provided
+-	case isUpdateTriggered(revision) && !isBlank(jobSpec.FromSavepoint):
++	case revision.IsUpdateTriggered() && !isBlank(jobSpec.FromSavepoint):
+ 		return jobSpec.FromSavepoint
+ 	// Latest savepoint
+ 	case jobStatus.SavepointLocation != "":
+@@ -872,7 +872,7 @@ func shouldCleanup(
+ 		return false
+ 	}
+ 
+-	if isUpdateTriggered(&cluster.Status.Revision) {
++	if cluster.Status.Revision.IsUpdateTriggered() {
+ 		return false
+ 	}
+ 
+diff --git a/controllers/flinkcluster_observer.go b/controllers/flinkcluster_observer.go
+index 04ebfa9..adf84fe 100644
+--- a/controllers/flinkcluster_observer.go
++++ b/controllers/flinkcluster_observer.go
+@@ -18,7 +18,6 @@ package controllers
+ 
+ import (
+ 	"context"
+-	"errors"
+ 	"fmt"
+ 	"github.com/go-logr/logr"
+ 	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
+@@ -96,10 +95,6 @@ func (o *ObservedClusterState) isClusterUpdating() bool {
+ 	return o.updateState == UpdateStateInProgress
+ }
+ 
+-func (r *Revision) isUpdateTriggered() bool {
+-	return getRevisionWithNameNumber(r.currentRevision) != getRevisionWithNameNumber(r.nextRevision)
+-}
+-
+ // Job submitter status.
+ func (s *FlinkJobSubmitter) getState() JobSubmitState {
+ 	switch {
+@@ -334,17 +329,19 @@ func (observer *ClusterStateObserver) observeSubmitter(submitter *FlinkJobSubmit
+ 	}
+ 	submitter.pod = pod
+ 
+-	// Extract submit result.
++	// Extract submission result.
+ 	var jobSubmissionCompleted = job.Status.Succeeded > 0 || job.Status.Failed > 0
+ 	if !jobSubmissionCompleted {
+ 		return nil
+ 	}
+ 	log.Info("Extracting the result of job submission because it is completed")
+ 	podLog = new(SubmitterLog)
+-	err = observeFlinkJobSubmitterLog(pod, podLog)
++	err = observer.observeFlinkJobSubmitterLog(pod, podLog)
+ 	if err != nil {
+ 		log.Error(err, "Failed to extract the job submission result")
+ 		podLog = nil
++	} else if podLog == nil {
++		log.Info("Observed submitter log", "state", "nil")
+ 	} else {
+ 		log.Info("Observed submitter log", "state", *podLog)
+ 	}
+@@ -389,10 +386,7 @@ func (observer *ClusterStateObserver) observeFlinkJobStatus(
+ 	}
+ 	flinkJob.list = flinkJobList
+ 
+-	// Extract the current job status and unexpected jobs, if submitted job ID is provided.
+-	if flinkJobID == "" {
+-		return
+-	}
++	// Extract the current job status and unexpected jobs.
+ 	for _, job := range flinkJobList.Jobs {
+ 		if flinkJobID == job.ID {
+ 			flinkJobStatus = &job
+@@ -402,19 +396,12 @@ func (observer *ClusterStateObserver) observeFlinkJobStatus(
+ 	}
+ 	flinkJob.status = flinkJobStatus
+ 	flinkJob.unexpected = flinkJobsUnexpected
+-
+-	// It is okay if there are multiple jobs, but at most one of them is
+-	// expected to be running. This is typically caused by job client
+-	// timed out and exited but the job submission was actually
+-	// successfully. When retrying, it first cancels the existing running
+-	// job which it has lost track of, then submit the job again.
+-	if len(flinkJobsUnexpected) > 1 {
+-		log.Error(
+-			errors.New("more than one unexpected Flink job were found"),
+-			"", "unexpected jobs", flinkJobsUnexpected)
+-	}
+-	if flinkJob != nil {
+-		log.Info("Observed Flink job", "flink job", flinkJob)
++	log.Info("Observed Flink job",
++		"submitted job status", flinkJob.status,
++		"all job list", flinkJob.list,
++		"unexpected job list", flinkJob.unexpected)
++	if len(flinkJobsUnexpected) > 0 {
++		log.Info("More than one unexpected Flink job were found!")
+ 	}
+ 
+ 	return
+@@ -695,12 +682,15 @@ func (observer *ClusterStateObserver) truncateHistory(observed *ObservedClusterS
+ }
+ 
+ // observeFlinkJobSubmit extract submit result from the pod termination log.
+-func observeFlinkJobSubmitterLog(observedPod *corev1.Pod, submitterLog *SubmitterLog) error {
++func (observer *ClusterStateObserver) observeFlinkJobSubmitterLog(observedPod *corev1.Pod, submitterLog *SubmitterLog) error {
++	var log = observer.log
+ 	var containerStatuses = observedPod.Status.ContainerStatuses
+ 	if len(containerStatuses) == 0 ||
+ 		containerStatuses[0].State.Terminated == nil ||
+ 		containerStatuses[0].State.Terminated.Message == "" {
+-		return fmt.Errorf("job pod found, but no termination log")
++		submitterLog = nil
++		log.Info("job pod found, but no termination log")
++		return nil
+ 	}
+ 
+ 	// The job submission script writes the submission log to the pod termination log at the end of execution.
+diff --git a/controllers/flinkcluster_observer_test.go b/controllers/flinkcluster_observer_test.go
+index c1b8533..3a03b5d 100644
+--- a/controllers/flinkcluster_observer_test.go
++++ b/controllers/flinkcluster_observer_test.go
+@@ -25,8 +25,8 @@ import (
+ func TestGetFlinkJobDeploymentState(t *testing.T) {
+ 	var pod corev1.Pod
+ 	var submitterLog, expected *SubmitterLog
+-	var err error
+ 	var termMsg string
++	var observer = ClusterStateObserver{}
+ 
+ 	// success
+ 	termMsg = `
+@@ -55,17 +55,6 @@ Job has been submitted with JobID ec74209eb4e3db8ae72db00bd7a830aa
+ 						Message: termMsg,
+ 					}}}}}}
+ 	submitterLog = new(SubmitterLog)
+-	_ = observeFlinkJobSubmitterLog(&pod, submitterLog)
++	_ = observer.observeFlinkJobSubmitterLog(&pod, submitterLog)
+ 	assert.DeepEqual(t, *submitterLog, *expected)
+-
+-	// failed: message not found
+-	pod = corev1.Pod{
+-		Status: corev1.PodStatus{
+-			ContainerStatuses: []corev1.ContainerStatus{{
+-				State: corev1.ContainerState{
+-					Terminated: &corev1.ContainerStateTerminated{
+-						Message: "",
+-					}}}}}}
+-	err = observeFlinkJobSubmitterLog(&pod, submitterLog)
+-	assert.Error(t, err, "job pod found, but no termination log")
+ }
+diff --git a/controllers/flinkcluster_reconciler.go b/controllers/flinkcluster_reconciler.go
+index 5d37ba5..06eef32 100644
+--- a/controllers/flinkcluster_reconciler.go
++++ b/controllers/flinkcluster_reconciler.go
+@@ -18,6 +18,7 @@ package controllers
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/runtime"
+@@ -52,7 +53,9 @@ type ClusterReconciler struct {
+ 	recorder    record.EventRecorder
+ }
+ 
+-var requeueResult = ctrl.Result{RequeueAfter: 10 * time.Second, Requeue: true}
++const JobCheckInterval = 10 * time.Second
++
++var requeueResult = ctrl.Result{RequeueAfter: JobCheckInterval, Requeue: true}
+ 
+ // Compares the desired state and the observed state, if there is a difference,
+ // takes actions to drive the observed state towards the desired state.
+@@ -65,7 +68,7 @@ func (reconciler *ClusterReconciler) reconcile() (ctrl.Result, error) {
+ 		return ctrl.Result{}, nil
+ 	}
+ 
+-	if reconciler.observed.isClusterUpdating() {
++	if shouldUpdateCluster(&reconciler.observed) {
+ 		reconciler.log.Info("The cluster update is in progress")
+ 	}
+ 	// If batch-scheduling enabled
+@@ -138,7 +141,7 @@ func (reconciler *ClusterReconciler) reconcileStatefulSet(
+ 
+ 	if desiredStatefulSet != nil && observedStatefulSet != nil {
+ 		var cluster = reconciler.observed.cluster
+-		if reconciler.observed.isClusterUpdating() && !isComponentUpdated(observedStatefulSet, cluster) {
++		if shouldUpdateCluster(&reconciler.observed) && !isComponentUpdated(observedStatefulSet, cluster) {
+ 			updateComponent := fmt.Sprintf("%v StatefulSet", component)
+ 			var err error
+ 			if *reconciler.observed.cluster.Spec.RecreateOnUpdate {
+@@ -255,7 +258,7 @@ func (reconciler *ClusterReconciler) reconcileJobManagerService() error {
+ 
+ 	if desiredJmService != nil && observedJmService != nil {
+ 		var cluster = reconciler.observed.cluster
+-		if reconciler.observed.isClusterUpdating() && !isComponentUpdated(observedJmService, cluster) {
++		if shouldUpdateCluster(&reconciler.observed) && !isComponentUpdated(observedJmService, cluster) {
+ 			// v1.Service API does not handle update correctly when below values are empty.
+ 			desiredJmService.SetResourceVersion(observedJmService.GetResourceVersion())
+ 			desiredJmService.Spec.ClusterIP = observedJmService.Spec.ClusterIP
+@@ -324,7 +327,7 @@ func (reconciler *ClusterReconciler) reconcileJobManagerIngress() error {
+ 
+ 	if desiredJmIngress != nil && observedJmIngress != nil {
+ 		var cluster = reconciler.observed.cluster
+-		if reconciler.observed.isClusterUpdating() && !isComponentUpdated(observedJmIngress, cluster) {
++		if shouldUpdateCluster(&reconciler.observed) && !isComponentUpdated(observedJmIngress, cluster) {
+ 			var err error
+ 			if *reconciler.observed.cluster.Spec.RecreateOnUpdate {
+ 				err = reconciler.deleteOldComponent(desiredJmIngress, observedJmIngress, "JobManager ingress")
+@@ -390,7 +393,7 @@ func (reconciler *ClusterReconciler) reconcileConfigMap() error {
+ 
+ 	if desiredConfigMap != nil && observedConfigMap != nil {
+ 		var cluster = reconciler.observed.cluster
+-		if reconciler.observed.isClusterUpdating() && !isComponentUpdated(observedConfigMap, cluster) {
++		if shouldUpdateCluster(&reconciler.observed) && !isComponentUpdated(observedConfigMap, cluster) {
+ 			var err error
+ 			if *reconciler.observed.cluster.Spec.RecreateOnUpdate {
+ 				err = reconciler.deleteOldComponent(desiredConfigMap, observedConfigMap, "ConfigMap")
+@@ -452,8 +455,7 @@ func (reconciler *ClusterReconciler) reconcileJob() (ctrl.Result, error) {
+ 	var observed = reconciler.observed
+ 	var recorded = observed.cluster.Status
+ 	var jobSpec = observed.cluster.Spec.Job
+-	var jobStatus = recorded.Components.Job
+-	var activeFlinkJob bool
++	var job = recorded.Components.Job
+ 	var err error
+ 	var jobID = reconciler.getFlinkJobID()
+ 
+@@ -462,28 +464,21 @@ func (reconciler *ClusterReconciler) reconcileJob() (ctrl.Result, error) {
+ 	var newControlStatus *v1beta1.FlinkClusterControlStatus
+ 	defer reconciler.updateStatus(&newSavepointStatus, &newControlStatus)
+ 
+-	// Check if Flink job is active
+-	if isJobActive(jobStatus) {
+-		activeFlinkJob = true
+-	} else {
+-		activeFlinkJob = false
+-	}
+-
+ 	// Create new Flink job submitter when starting new job, updating job or restarting job in failure.
+-	if desiredJob != nil && !activeFlinkJob {
++	if desiredJob != nil && !job.IsActive() {
+ 		log.Info("Deploying Flink job")
+ 
++		// TODO: Record event or introduce Condition in CRD status to notify update state pended.
++		// https://github.com/kubernetes/apimachinery/blob/57f2a0733447cfd41294477d833cce6580faaca3/pkg/apis/meta/v1/types.go#L1376
+ 		var unexpectedJobs = observed.flinkJob.unexpected
+ 		if len(unexpectedJobs) > 0 {
+-			if jobSpec.MaxStateAgeToRestoreSeconds != nil {
+-				log.Info("Cancelling unexpected running job(s)")
+-				err = reconciler.cancelUnexpectedJobs(false /* takeSavepoint */)
+-				return requeueResult, err
+-			}
+-			// In this case the user should identify the cause of the problem
+-			// so that the job is not accidentally executed multiple times by mistake or the Flink operator's error.
+-			err = fmt.Errorf("failed to create job submitter, unexpected jobs found: %v", unexpectedJobs)
+-			return ctrl.Result{}, err
++			// This is an exceptional situation.
++			// There should be no jobs because all jobs are terminated in the previous iterations.
++			// In this case user should identify the problem so that the job is not executed multiple times unintentionally
++			// cause of Flink error, Flink operator error or other unknown error.
++			// If user want to proceed, unexpected jobs should be terminated.
++			log.Error(errors.New("unexpected jobs found"), "Failed to create job submitter", "unexpected jobs", unexpectedJobs)
++			return ctrl.Result{}, nil
+ 		}
+ 
+ 		// Create Flink job submitter
+@@ -507,17 +502,20 @@ func (reconciler *ClusterReconciler) reconcileJob() (ctrl.Result, error) {
+ 		return requeueResult, err
+ 	}
+ 
+-	if desiredJob != nil && activeFlinkJob {
+-		if jobStatus.State == v1beta1.JobStateDeploying {
+-			log.Info("Job submitter is deployed and wait until it is completed")
++	if desiredJob != nil && job.IsActive() {
++		if job.State == v1beta1.JobStateDeploying {
++			log.Info("Job submitter is deployed, wait until completed")
+ 			return requeueResult, nil
+ 		}
+-		if isUpdateTriggered(&recorded.Revision) {
++
++		// Suspend or stop job to proceed update.
++		if recorded.Revision.IsUpdateTriggered() {
+ 			log.Info("Preparing job update")
+-			var shouldSuspend = jobSpec.TakeSavepointOnUpdate == nil || *jobSpec.TakeSavepointOnUpdate == true || isBlank(jobSpec.FromSavepoint)
++			var takeSavepoint = jobSpec.TakeSavepointOnUpdate == nil || *jobSpec.TakeSavepointOnUpdate
++			var shouldSuspend = takeSavepoint && isBlank(jobSpec.FromSavepoint)
+ 			if shouldSuspend {
+ 				newSavepointStatus, err = reconciler.trySuspendJob()
+-			} else {
++			} else if shouldUpdateJob(&observed) {
+ 				err = reconciler.cancelJob()
+ 			}
+ 			return requeueResult, err
+@@ -542,7 +540,7 @@ func (reconciler *ClusterReconciler) reconcileJob() (ctrl.Result, error) {
+ 	}
+ 
+ 	// Job cancel requested. Stop Flink job.
+-	if desiredJob == nil && activeFlinkJob {
++	if desiredJob == nil && job.IsActive() {
+ 		log.Info("Stopping job", "jobID", jobID)
+ 		newSavepointStatus, err = reconciler.trySuspendJob()
+ 		var userControl = getNewControlRequest(observed.cluster)
+@@ -552,7 +550,7 @@ func (reconciler *ClusterReconciler) reconcileJob() (ctrl.Result, error) {
+ 		return requeueResult, err
+ 	}
+ 
+-	if isJobStopped(jobStatus) {
++	if job.IsStopped() {
+ 		log.Info("Job has finished, no action")
+ 	}
+ 
+@@ -633,7 +631,7 @@ func (reconciler *ClusterReconciler) cancelJob() error {
+ 		return err
+ 	}
+ 
+-	// TODO: It would be nice not to delete the job submitters immediately, and retain the latest ones for debug.
++	// TODO: Not to delete the job submitter immediately, and retain the latest ones for inspection.
+ 	var observedSubmitter = reconciler.observed.flinkJobSubmitter.job
+ 	if observedSubmitter != nil {
+ 		var err = reconciler.deleteJob(observedSubmitter)
+@@ -723,7 +721,7 @@ func (reconciler *ClusterReconciler) canSuspendJob(jobID string, s *v1beta1.Save
+ 		log.Info("Savepoint failed on previous request")
+ 	}
+ 
+-	var retryTimeArrived = hasTimeElapsed(s.UpdateTime, time.Now(), SavepointRequestRetryIntervalSec)
++	var retryTimeArrived = hasTimeElapsed(s.UpdateTime, time.Now(), SavepointRetryIntervalSeconds)
+ 	if !retryTimeArrived {
+ 		log.Info("Wait until next retry time arrived")
+ 	}
+@@ -734,7 +732,8 @@ func (reconciler *ClusterReconciler) shouldTakeSavepoint() string {
+ 	var observed = reconciler.observed
+ 	var cluster = observed.cluster
+ 	var jobSpec = observed.cluster.Spec.Job
+-	var jobStatus = observed.cluster.Status.Components.Job
++	var job = observed.cluster.Status.Components.Job
++	var savepoint = observed.cluster.Status.Savepoint
+ 	var newRequestedControl = getNewControlRequest(cluster)
+ 
+ 	if !canTakeSavepoint(*reconciler.observed.cluster) {
+@@ -747,11 +746,11 @@ func (reconciler *ClusterReconciler) shouldTakeSavepoint() string {
+ 	// Should stop job with savepoint by user requested control
+ 	case newRequestedControl == v1beta1.ControlNameJobCancel || (jobSpec.CancelRequested != nil && *jobSpec.CancelRequested):
+ 		return v1beta1.SavepointTriggerReasonJobCancel
+-	// TODO: spec.job.savepointGeneration will be deprecated
+ 	// Take savepoint by user request
+ 	case newRequestedControl == v1beta1.ControlNameSavepoint:
+ 		fallthrough
+-	case jobSpec.SavepointGeneration > jobStatus.SavepointGeneration:
++	// TODO: spec.job.savepointGeneration will be deprecated
++	case jobSpec.SavepointGeneration > job.SavepointGeneration:
+ 		// Triggered by savepointGeneration increased.
+ 		// When previous savepoint is failed, savepoint trigger by spec.job.savepointGeneration is not possible
+ 		// because the field cannot be increased more.
+@@ -759,19 +758,27 @@ func (reconciler *ClusterReconciler) shouldTakeSavepoint() string {
+ 		return v1beta1.SavepointTriggerReasonUserRequested
+ 	// Scheduled auto savepoint
+ 	case jobSpec.AutoSavepointSeconds != nil:
++		// When previous try was failed, check retry interval.
++		if savepoint.IsFailed() && savepoint.TriggerReason == v1beta1.SavepointTriggerReasonScheduled {
++			var nextRetryTime = getTime(savepoint.UpdateTime).Add(SavepointRetryIntervalSeconds * time.Second)
++			if time.Now().After(nextRetryTime) {
++				return v1beta1.SavepointTriggerReasonScheduled
++			} else {
++				return ""
++			}
++		}
+ 		// Check if next trigger time arrived.
+ 		var compareTime string
+-		if len(jobStatus.SavepointTime) == 0 {
+-			compareTime = jobStatus.StartTime
++		if len(job.SavepointTime) == 0 {
++			compareTime = job.StartTime
+ 		} else {
+-			compareTime = jobStatus.SavepointTime
++			compareTime = job.SavepointTime
+ 		}
+ 		var nextTime = getTimeAfterAddedSeconds(compareTime, int64(*jobSpec.AutoSavepointSeconds))
+ 		if time.Now().After(nextTime) {
+ 			return v1beta1.SavepointTriggerReasonScheduled
+ 		}
+ 	}
+-
+ 	return ""
+ }
+ 
+@@ -827,7 +834,8 @@ func (reconciler *ClusterReconciler) takeSavepoint(
+ 	return err
+ }
+ 
+-func (reconciler *ClusterReconciler) updateStatus(ss **v1beta1.SavepointStatus, cs **v1beta1.FlinkClusterControlStatus) {
++func (reconciler *ClusterReconciler) updateStatus(
++	ss **v1beta1.SavepointStatus, cs **v1beta1.FlinkClusterControlStatus) {
+ 	var log = reconciler.log
+ 
+ 	var savepointStatus = *ss
+@@ -885,16 +893,24 @@ func (reconciler *ClusterReconciler) updateJobDeployStatus() error {
+ 	var clusterClone = observedCluster.DeepCopy()
+ 	var newJob = clusterClone.Status.Components.Job
+ 
++	// Reset running job information.
++	newJob.ID = ""
++	newJob.StartTime = ""
++	newJob.EndTime = ""
++
++	// Mark as job submitter is deployed.
++	setTimestamp(&newJob.DeployTime)
++	setTimestamp(&clusterClone.Status.LastUpdateTime)
++
+ 	// Latest savepoint location should be fromSavepoint.
+ 	var fromSavepoint = getFromSavepoint(desiredJobSubmitter.Spec)
+ 	newJob.FromSavepoint = fromSavepoint
+ 	if newJob.SavepointLocation != "" {
+ 		newJob.SavepointLocation = fromSavepoint
+ 	}
+-	setTimestamp(&newJob.DeployTime) // Mark as job submitter is deployed.
+-	setTimestamp(&clusterClone.Status.LastUpdateTime)
+-	err = reconciler.k8sClient.Status().Update(reconciler.context, clusterClone)
+ 
++	// Update job status.
++	err = reconciler.k8sClient.Status().Update(reconciler.context, clusterClone)
+ 	if err != nil {
+ 		log.Error(
+ 			err, "Failed to update job status for new job submitter", "error", err)
+diff --git a/controllers/flinkcluster_updater.go b/controllers/flinkcluster_updater.go
+index 0e15fe7..18aedba 100644
+--- a/controllers/flinkcluster_updater.go
++++ b/controllers/flinkcluster_updater.go
+@@ -195,7 +195,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 
+ 	// ConfigMap.
+ 	var observedConfigMap = observed.configMap
+-	if !isComponentUpdated(observedConfigMap, observed.cluster) && observed.isClusterUpdating() {
++	if !isComponentUpdated(observedConfigMap, observed.cluster) && shouldUpdateCluster(observed) {
+ 		recorded.Components.ConfigMap.DeepCopyInto(&status.Components.ConfigMap)
+ 		status.Components.ConfigMap.State = v1beta1.ComponentStateUpdating
+ 	} else if observedConfigMap != nil {
+@@ -211,7 +211,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 
+ 	// JobManager StatefulSet.
+ 	var observedJmStatefulSet = observed.jmStatefulSet
+-	if !isComponentUpdated(observedJmStatefulSet, observed.cluster) && observed.isClusterUpdating() {
++	if !isComponentUpdated(observedJmStatefulSet, observed.cluster) && shouldUpdateCluster(observed) {
+ 		recorded.Components.JobManagerStatefulSet.DeepCopyInto(&status.Components.JobManagerStatefulSet)
+ 		status.Components.JobManagerStatefulSet.State = v1beta1.ComponentStateUpdating
+ 	} else if observedJmStatefulSet != nil {
+@@ -230,7 +230,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 
+ 	// JobManager service.
+ 	var observedJmService = observed.jmService
+-	if !isComponentUpdated(observedJmService, observed.cluster) && observed.isClusterUpdating() {
++	if !isComponentUpdated(observedJmService, observed.cluster) && shouldUpdateCluster(observed) {
+ 		recorded.Components.JobManagerService.DeepCopyInto(&status.Components.JobManagerService)
+ 		status.Components.JobManagerService.State = v1beta1.ComponentStateUpdating
+ 	} else if observedJmService != nil {
+@@ -281,7 +281,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 
+ 	// (Optional) JobManager ingress.
+ 	var observedJmIngress = observed.jmIngress
+-	if !isComponentUpdated(observedJmIngress, observed.cluster) && observed.isClusterUpdating() {
++	if !isComponentUpdated(observedJmIngress, observed.cluster) && shouldUpdateCluster(observed) {
+ 		status.Components.JobManagerIngress = &v1beta1.JobManagerIngressStatus{}
+ 		recorded.Components.JobManagerIngress.DeepCopyInto(status.Components.JobManagerIngress)
+ 		status.Components.JobManagerIngress.State = v1beta1.ComponentStateUpdating
+@@ -364,7 +364,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 
+ 	// TaskManager StatefulSet.
+ 	var observedTmStatefulSet = observed.tmStatefulSet
+-	if !isComponentUpdated(observedTmStatefulSet, observed.cluster) && observed.isClusterUpdating() {
++	if !isComponentUpdated(observedTmStatefulSet, observed.cluster) && shouldUpdateCluster(observed) {
+ 		recorded.Components.TaskManagerStatefulSet.DeepCopyInto(&status.Components.TaskManagerStatefulSet)
+ 		status.Components.TaskManagerStatefulSet.State = v1beta1.ComponentStateUpdating
+ 	} else if observedTmStatefulSet != nil {
+@@ -393,10 +393,10 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 			status.State = v1beta1.ClusterStateRunning
+ 		}
+ 	case v1beta1.ClusterStateUpdating:
+-		if observed.isClusterUpdating() {
++		if shouldUpdateCluster(observed) {
+ 			status.State = v1beta1.ClusterStateUpdating
+ 		} else if runningComponents < totalComponents {
+-			if isUpdateTriggered(&recorded.Revision) {
++			if recorded.Revision.IsUpdateTriggered() {
+ 				status.State = v1beta1.ClusterStateUpdating
+ 			} else {
+ 				status.State = v1beta1.ClusterStateReconciling
+@@ -407,9 +407,9 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 	case v1beta1.ClusterStateRunning,
+ 		v1beta1.ClusterStateReconciling:
+ 		var jobStatus = recorded.Components.Job
+-		if observed.isClusterUpdating() {
++		if shouldUpdateCluster(observed) {
+ 			status.State = v1beta1.ClusterStateUpdating
+-		} else if !isUpdateTriggered(&recorded.Revision) && isJobStopped(jobStatus) {
++		} else if !recorded.Revision.IsUpdateTriggered() && jobStatus.IsStopped() {
+ 			var policy = observed.cluster.Spec.Job.CleanupPolicy
+ 			if jobStatus.State == v1beta1.JobStateSucceeded &&
+ 				policy.AfterJobSucceeds != v1beta1.CleanupActionKeepCluster {
+@@ -430,8 +430,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 		}
+ 	case v1beta1.ClusterStateStopping,
+ 		v1beta1.ClusterStatePartiallyStopped:
+-		//if isClusterUpdating {
+-		if observed.isClusterUpdating() {
++		if shouldUpdateCluster(observed) {
+ 			status.State = v1beta1.ClusterStateUpdating
+ 		} else if runningComponents == 0 {
+ 			status.State = v1beta1.ClusterStateStopped
+@@ -441,7 +440,7 @@ func (updater *ClusterStatusUpdater) deriveClusterStatus(
+ 			status.State = v1beta1.ClusterStateStopping
+ 		}
+ 	case v1beta1.ClusterStateStopped:
+-		if isUpdateTriggered(&recorded.Revision) {
++		if recorded.Revision.IsUpdateTriggered() {
+ 			status.State = v1beta1.ClusterStateUpdating
+ 		} else {
+ 			status.State = v1beta1.ClusterStateStopped
+@@ -535,13 +534,13 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
+ 	switch {
+ 	case oldJob == nil:
+ 		newJobState = v1beta1.JobStatePending
+-	case observed.isClusterUpdating():
++	case shouldUpdateJob(&observed):
+ 		newJobState = v1beta1.JobStateUpdating
+-	case shouldRestartJob(jobSpec, oldJob):
++	case oldJob.ShouldRestart(jobSpec):
+ 		newJobState = v1beta1.JobStateRestarting
+-	case isJobPending(oldJob) && oldJob.DeployTime != "":
++	case oldJob.IsPending() && oldJob.DeployTime != "":
+ 		newJobState = v1beta1.JobStateDeploying
+-	case isJobStopped(oldJob):
++	case oldJob.IsStopped():
+ 		newJobState = oldJob.State
+ 	// Derive the job state from the observed Flink job, if it exists.
+ 	case observedFlinkJob != nil:
+@@ -567,10 +566,13 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
+ 		var submitterState = observedSubmitter.getState()
+ 		if submitterState == JobDeployStateUnknown {
+ 			newJobState = v1beta1.JobStateLost
+-			// Case in which the job submission clearly fails even if it is not confirmed by JobManager
+-			// Job submitter is deployed but failed.
+-		} else if submitterState == JobDeployStateFailed {
++			break
++		}
++		// Case in which the job submission clearly fails even if it is not confirmed by JobManager
++		// Job submitter is deployed but failed.
++		if submitterState == JobDeployStateFailed {
+ 			newJobState = v1beta1.JobStateDeployFailed
++			break
+ 		}
+ 		newJobState = oldJob.State
+ 	}
+@@ -583,17 +585,13 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
+ 	if oldJob == nil || oldJob.State != newJob.State {
+ 		// TODO: It would be ideal to set the times with the timestamp retrieved from the Flink API like /jobs/{job-id}.
+ 		switch {
+-		case isJobPending(newJob):
++		case newJob.IsPending():
+ 			newJob.DeployTime = ""
+ 			if newJob.State == v1beta1.JobStateUpdating {
+ 				newJob.RestartCount = 0
+ 			} else if newJob.State == v1beta1.JobStateRestarting {
+ 				newJob.RestartCount++
+ 			}
+-		case newJob.State == v1beta1.JobStateDeploying:
+-			newJob.ID = ""
+-			newJob.StartTime = ""
+-			newJob.EndTime = ""
+ 		case newJob.State == v1beta1.JobStateRunning:
+ 			setTimestamp(&newJob.StartTime)
+ 			newJob.EndTime = ""
+@@ -601,7 +599,7 @@ func (updater *ClusterStatusUpdater) deriveJobStatus() *v1beta1.JobStatus {
+ 			if oldJob.FinalSavepoint {
+ 				newJob.FinalSavepoint = false
+ 			}
+-		case isJobStopped(newJob):
++		case newJob.IsStopped():
+ 			if newJob.EndTime == "" {
+ 				setTimestamp(&newJob.EndTime)
+ 			}
+@@ -826,7 +824,7 @@ func (updater *ClusterStatusUpdater) deriveSavepointStatus(
+ 	// Check failure conditions of savepoint in progress.
+ 	if s.State == v1beta1.SavepointStateInProgress {
+ 		switch {
+-		case isJobStopped(newJobStatus):
++		case newJobStatus.IsStopped():
+ 			errMsg = "Flink job is stopped."
+ 			s.State = v1beta1.SavepointStateFailed
+ 		case flinkJobID == nil:
+@@ -837,7 +835,8 @@ func (updater *ClusterStatusUpdater) deriveSavepointStatus(
+ 			s.State = v1beta1.SavepointStateFailed
+ 		}
+ 	}
+-
++	// TODO: Record event or introduce Condition in CRD status to notify update state pended.
++	// https://github.com/kubernetes/apimachinery/blob/57f2a0733447cfd41294477d833cce6580faaca3/pkg/apis/meta/v1/types.go#L1376
+ 	// Make up message.
+ 	if errMsg != "" {
+ 		if s.TriggerReason == v1beta1.SavepointTriggerReasonUpdate {
+@@ -877,19 +876,17 @@ func deriveControlStatus(
+ 		case v1beta1.ControlNameJobCancel:
+ 			if newSavepoint.State == v1beta1.SavepointStateSucceeded && newJob.State == v1beta1.JobStateCancelled {
+ 				c.State = v1beta1.ControlStateSucceeded
+-			} else if isJobStopped(newJob) {
++			} else if newJob.IsStopped() {
+ 				c.Message = "Aborted job cancellation: savepoint is not completed, but job is stopped already."
+ 				c.State = v1beta1.ControlStateFailed
+-			} else if newSavepoint.TriggerReason == v1beta1.SavepointTriggerReasonJobCancel &&
+-				(newSavepoint.State == v1beta1.SavepointStateFailed || newSavepoint.State == v1beta1.SavepointStateTriggerFailed) {
++			} else if newSavepoint.IsFailed() && newSavepoint.TriggerReason == v1beta1.SavepointTriggerReasonJobCancel {
+ 				c.Message = "Aborted job cancellation: failed to take savepoint."
+ 				c.State = v1beta1.ControlStateFailed
+ 			}
+ 		case v1beta1.ControlNameSavepoint:
+ 			if newSavepoint.State == v1beta1.SavepointStateSucceeded {
+ 				c.State = v1beta1.ControlStateSucceeded
+-			} else if newSavepoint.TriggerReason == v1beta1.SavepointTriggerReasonUserRequested &&
+-				(newSavepoint.State == v1beta1.SavepointStateFailed || newSavepoint.State == v1beta1.SavepointStateTriggerFailed) {
++			} else if newSavepoint.IsFailed() && newSavepoint.TriggerReason == v1beta1.SavepointTriggerReasonUserRequested {
+ 				c.State = v1beta1.ControlStateFailed
+ 			}
+ 		}
+diff --git a/controllers/flinkcluster_util.go b/controllers/flinkcluster_util.go
+index 8a9f709..bb14008 100644
+--- a/controllers/flinkcluster_util.go
++++ b/controllers/flinkcluster_util.go
+@@ -20,7 +20,7 @@ import (
+ 	"bytes"
+ 	"encoding/json"
+ 	"fmt"
+-	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
++	"github.com/googlecloudplatform/flink-operator/api/v1beta1"
+ 	"github.com/googlecloudplatform/flink-operator/controllers/flinkclient"
+ 	"github.com/googlecloudplatform/flink-operator/controllers/history"
+ 	appsv1 "k8s.io/api/apps/v1"
+@@ -42,7 +42,7 @@ const (
+ 
+ 	RevisionNameLabel = "flinkoperator.k8s.io/revision-name"
+ 
+-	SavepointRequestRetryIntervalSec = 10
++	SavepointRetryIntervalSeconds = 10
+ )
+ 
+ type UpdateState string
+@@ -137,17 +137,22 @@ func setTimestamp(target *string) {
+ 	*target = tc.ToString(now)
+ }
+ 
++func getTime(timeStr string) time.Time {
++	var tc TimeConverter
++	return tc.FromString(timeStr)
++}
++
+ func isBlank(s *string) bool {
+-	return s == nil || *s == "" || strings.TrimSpace(*s) == ""
++	return s == nil || strings.TrimSpace(*s) == ""
+ }
+ 
+ // Checks whether it is possible to take savepoint.
+ func canTakeSavepoint(cluster v1beta1.FlinkCluster) bool {
+ 	var jobSpec = cluster.Spec.Job
+ 	var savepointStatus = cluster.Status.Savepoint
+-	var jobStatus = cluster.Status.Components.Job
++	var job = cluster.Status.Components.Job
+ 	return jobSpec != nil && jobSpec.SavepointsDir != nil &&
+-		!isJobStopped(jobStatus) &&
++		!job.IsStopped() &&
+ 		(savepointStatus == nil || savepointStatus.State != v1beta1.SavepointStateInProgress)
+ }
+ 
+@@ -158,18 +163,6 @@ func shouldStopJob(cluster *v1beta1.FlinkCluster) bool {
+ 		(cancelRequested != nil && *cancelRequested)
+ }
+ 
+-// shouldRestartJob returns true if the controller should restart failed or lost job.
+-// The controller can restart the job only if there is a fresh savepoint to restore, recorded in status field.
+-func shouldRestartJob(
+-	jobSpec *v1beta1.JobSpec,
+-	jobStatus *v1beta1.JobStatus) bool {
+-	var restartEnabled = jobSpec.RestartPolicy != nil && *jobSpec.RestartPolicy == v1beta1.JobRestartPolicyFromSavepointOnFailure
+-	if restartEnabled && isJobFailed(jobStatus) && isSavepointUpToDate(jobSpec, jobStatus) {
+-		return true
+-	}
+-	return false
+-}
+-
+ func getFromSavepoint(jobSpec batchv1.JobSpec) string {
+ 	var jobArgs = jobSpec.Template.Spec.Containers[0].Args
+ 	for i, arg := range jobArgs {
+@@ -346,63 +339,11 @@ func getSavepointEvent(status v1beta1.SavepointStatus) (eventType string, eventR
+ 	return
+ }
+ 
+-func isJobActive(j *v1beta1.JobStatus) bool {
+-	return j != nil &&
+-		(j.State == v1beta1.JobStateRunning || j.State == v1beta1.JobStateDeploying)
+-}
+-
+-func isJobPending(j *v1beta1.JobStatus) bool {
+-	return j != nil &&
+-		(j.State == v1beta1.JobStatePending ||
+-			j.State == v1beta1.JobStateUpdating ||
+-			j.State == v1beta1.JobStateRestarting)
+-}
+-
+-func isJobFailed(j *v1beta1.JobStatus) bool {
+-	return j != nil &&
+-		(j.State == v1beta1.JobStateFailed ||
+-			j.State == v1beta1.JobStateLost ||
+-			j.State == v1beta1.JobStateDeployFailed)
+-}
+-
+-func isJobStopped(j *v1beta1.JobStatus) bool {
+-	return j != nil &&
+-		(j.State == v1beta1.JobStateSucceeded ||
+-			j.State == v1beta1.JobStateCancelled ||
+-			j.State == v1beta1.JobStateFailed ||
+-			j.State == v1beta1.JobStateLost ||
+-			j.State == v1beta1.JobStateDeployFailed)
+-}
+-
+-func isUpdateTriggered(r *v1beta1.RevisionStatus) bool {
+-	return r.CurrentRevision != r.NextRevision
+-}
+-
+ func isUserControlFinished(controlStatus *v1beta1.FlinkClusterControlStatus) bool {
+ 	return controlStatus.State == v1beta1.ControlStateSucceeded ||
+ 		controlStatus.State == v1beta1.ControlStateFailed
+ }
+ 
+-// Check if the savepoint is up to date.
+-func isSavepointUpToDate(jobSpec *v1beta1.JobSpec, jobStatus *v1beta1.JobStatus) bool {
+-	if jobStatus.FinalSavepoint {
+-		return true
+-	}
+-	if jobSpec.MaxStateAgeToRestoreSeconds == nil ||
+-		jobStatus.SavepointLocation == "" ||
+-		jobStatus.SavepointTime == "" ||
+-		jobStatus.EndTime == "" {
+-		return false
+-	}
+-	var tc = &TimeConverter{}
+-	var jobEndTime = tc.FromString(jobStatus.EndTime)
+-	var stateMaxAge = int(*jobSpec.MaxStateAgeToRestoreSeconds)
+-	if !hasTimeElapsed(jobStatus.SavepointTime, jobEndTime, stateMaxAge) {
+-		return true
+-	}
+-	return false
+-}
+-
+ // Check time has passed
+ func hasTimeElapsed(timeToCheckStr string, now time.Time, intervalSec int) bool {
+ 	tc := &TimeConverter{}
+@@ -419,7 +360,7 @@ func hasTimeElapsed(timeToCheckStr string, now time.Time, intervalSec int) bool
+ // If the component is not observed and it is required, then it is not updated yet.
+ // If the component is not observed and it is optional, but it is specified in the spec, then it is not updated yet.
+ func isComponentUpdated(component runtime.Object, cluster *v1beta1.FlinkCluster) bool {
+-	if !isUpdateTriggered(&cluster.Status.Revision) {
++	if !cluster.Status.Revision.IsUpdateTriggered() {
+ 		return true
+ 	}
+ 	switch o := component.(type) {
+@@ -486,7 +427,7 @@ func isUpdatedAll(observed ObservedClusterState) bool {
+ 
+ // isClusterUpdateToDate checks whether all cluster components are replaced to next revision.
+ func isClusterUpdateToDate(observed *ObservedClusterState) bool {
+-	if !isUpdateTriggered(&observed.cluster.Status.Revision) {
++	if !observed.cluster.Status.Revision.IsUpdateTriggered() {
+ 		return true
+ 	}
+ 	components := []runtime.Object{
+@@ -513,18 +454,6 @@ func finalSavepointRequested(jobID string, s *v1beta1.SavepointStatus) bool {
+ 			s.TriggerReason == v1beta1.SavepointTriggerReasonJobCancel)
+ }
+ 
+-func updateReady(jobSpec *v1beta1.JobSpec, job *v1beta1.JobStatus) bool {
+-	var takeSavepoint bool
+-	if jobSpec != nil {
+-		takeSavepoint = jobSpec.TakeSavepointOnUpdate == nil || *jobSpec.TakeSavepointOnUpdate
+-	}
+-	return job == nil ||
+-		!isBlank(jobSpec.FromSavepoint) ||
+-		!takeSavepoint ||
+-		(isJobActive(job) && job.FinalSavepoint) ||
+-		(!isJobActive(job) && isSavepointUpToDate(jobSpec, job))
+-}
+-
+ func getUpdateState(observed *ObservedClusterState) UpdateState {
+ 	if observed.cluster == nil {
+ 		return ""
+@@ -534,11 +463,11 @@ func getUpdateState(observed *ObservedClusterState) UpdateState {
+ 	var job = recorded.Components.Job
+ 	var jobSpec = observed.cluster.Spec.Job
+ 
+-	if !isUpdateTriggered(&revision) {
++	if !revision.IsUpdateTriggered() {
+ 		return ""
+ 	}
+ 	switch {
+-	case isJobActive(job) || !updateReady(jobSpec, job):
++	case !job.UpdateReady(jobSpec, observed.observeTime):
+ 		return UpdateStatePreparing
+ 	case !isClusterUpdateToDate(observed):
+ 		return UpdateStateInProgress
+@@ -546,6 +475,15 @@ func getUpdateState(observed *ObservedClusterState) UpdateState {
+ 	return UpdateStateFinished
+ }
+ 
++func shouldUpdateJob(observed *ObservedClusterState) bool {
++	return observed.updateState == UpdateStateInProgress
++}
++
++func shouldUpdateCluster(observed *ObservedClusterState) bool {
++	var job = observed.cluster.Status.Components.Job
++	return !job.IsActive() && observed.updateState == UpdateStateInProgress
++}
++
+ func getNonLiveHistory(revisions []*appsv1.ControllerRevision, historyLimit int) []*appsv1.ControllerRevision {
+ 
+ 	history := append([]*appsv1.ControllerRevision{}, revisions...)
+diff --git a/controllers/flinkcluster_util_test.go b/controllers/flinkcluster_util_test.go
+index d0f9e6c..2608964 100644
+--- a/controllers/flinkcluster_util_test.go
++++ b/controllers/flinkcluster_util_test.go
+@@ -17,6 +17,8 @@ limitations under the License.
+ package controllers
+ 
+ import (
++	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
++	"gotest.tools/assert"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	batchv1 "k8s.io/api/batch/v1"
+ 	corev1 "k8s.io/api/core/v1"
+@@ -26,10 +28,6 @@ import (
+ 	"k8s.io/apimachinery/pkg/runtime"
+ 	"os"
+ 	"testing"
+-	"time"
+-
+-	v1beta1 "github.com/googlecloudplatform/flink-operator/api/v1beta1"
+-	"gotest.tools/assert"
+ )
+ 
+ func TestTimeConverter(t *testing.T) {
+@@ -46,71 +44,6 @@ func TestTimeConverter(t *testing.T) {
+ 	assert.Assert(t, str3 == str4)
+ }
+ 
+-func TestShouldRestartJob(t *testing.T) {
+-	var tc = &TimeConverter{}
+-	var restartOnFailure = v1beta1.JobRestartPolicyFromSavepointOnFailure
+-	var neverRestart = v1beta1.JobRestartPolicyNever
+-	var maxStateAgeToRestoreSeconds = int32(300) // 5 min
+-
+-	// Restart with savepoint up to date
+-	var savepointTime = tc.ToString(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
+-	var endTime = tc.ToString(time.Date(2020, 1, 1, 0, 1, 0, 0, time.UTC))
+-	var jobSpec = v1beta1.JobSpec{
+-		RestartPolicy:               &restartOnFailure,
+-		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+-	}
+-	var jobStatus = v1beta1.JobStatus{
+-		State:             v1beta1.JobStateFailed,
+-		SavepointLocation: "gs://my-bucket/savepoint-123",
+-		SavepointTime:     savepointTime,
+-		EndTime:           endTime,
+-	}
+-	var restart = shouldRestartJob(&jobSpec, &jobStatus)
+-	assert.Equal(t, restart, true)
+-
+-	// Not restart without savepoint
+-	jobSpec = v1beta1.JobSpec{
+-		RestartPolicy:               &restartOnFailure,
+-		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+-	}
+-	jobStatus = v1beta1.JobStatus{
+-		State:   v1beta1.JobStateFailed,
+-		EndTime: endTime,
+-	}
+-	restart = shouldRestartJob(&jobSpec, &jobStatus)
+-	assert.Equal(t, restart, false)
+-
+-	// Not restart with restartPolicy Never
+-	jobSpec = v1beta1.JobSpec{
+-		RestartPolicy:               &neverRestart,
+-		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+-	}
+-	jobStatus = v1beta1.JobStatus{
+-		State:             v1beta1.JobStateFailed,
+-		SavepointLocation: "gs://my-bucket/savepoint-123",
+-		SavepointTime:     savepointTime,
+-		EndTime:           endTime,
+-	}
+-	restart = shouldRestartJob(&jobSpec, &jobStatus)
+-	assert.Equal(t, restart, false)
+-
+-	// Not restart with old savepoint
+-	savepointTime = tc.ToString(time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC))
+-	endTime = tc.ToString(time.Date(2020, 1, 1, 0, 5, 0, 0, time.UTC))
+-	jobSpec = v1beta1.JobSpec{
+-		RestartPolicy:               &neverRestart,
+-		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+-	}
+-	jobStatus = v1beta1.JobStatus{
+-		State:             v1beta1.JobStateFailed,
+-		SavepointLocation: "gs://my-bucket/savepoint-123",
+-		SavepointTime:     savepointTime,
+-		EndTime:           endTime,
+-	}
+-	restart = shouldRestartJob(&jobSpec, &jobStatus)
+-	assert.Equal(t, restart, false)
+-}
+-
+ func TestGetRetryCount(t *testing.T) {
+ 	var data1 = map[string]string{}
+ 	var result1, _ = getRetryCount(data1)
+@@ -270,46 +203,6 @@ func TestGetNextRevisionNumber(t *testing.T) {
+ 	assert.Equal(t, nextRevision, int64(3))
+ }
+ 
+-func TestIsSavepointUpToDate(t *testing.T) {
+-	var tc = &TimeConverter{}
+-	var savepointTime = time.Now()
+-	var jobEndTime = savepointTime.Add(time.Second * 100)
+-	var maxStateAgeToRestoreSeconds = int32(300)
+-	var jobSpec = v1beta1.JobSpec{
+-		MaxStateAgeToRestoreSeconds: &maxStateAgeToRestoreSeconds,
+-	}
+-	var jobStatus = v1beta1.JobStatus{
+-		State:             v1beta1.JobStateFailed,
+-		SavepointTime:     tc.ToString(savepointTime),
+-		SavepointLocation: "gs://my-bucket/savepoint-123",
+-	}
+-	var update = isSavepointUpToDate(&jobSpec, &jobStatus)
+-	assert.Equal(t, update, true)
+-
+-	// old
+-	savepointTime = time.Now()
+-	jobEndTime = savepointTime.Add(time.Second * 500)
+-	jobStatus = v1beta1.JobStatus{
+-		State:             v1beta1.JobStateFailed,
+-		SavepointTime:     tc.ToString(savepointTime),
+-		SavepointLocation: "gs://my-bucket/savepoint-123",
+-		EndTime:           tc.ToString(jobEndTime),
+-	}
+-	update = isSavepointUpToDate(&jobSpec, &jobStatus)
+-	assert.Equal(t, update, false)
+-
+-	// Fails without savepointLocation
+-	savepointTime = time.Now()
+-	jobEndTime = savepointTime.Add(time.Second * 500)
+-	jobStatus = v1beta1.JobStatus{
+-		State:         v1beta1.JobStateFailed,
+-		SavepointTime: tc.ToString(savepointTime),
+-		EndTime:       tc.ToString(jobEndTime),
+-	}
+-	update = isSavepointUpToDate(&jobSpec, &jobStatus)
+-	assert.Equal(t, update, false)
+-}
+-
+ func TestIsComponentUpdated(t *testing.T) {
+ 	var cluster = v1beta1.FlinkCluster{
+ 		Status: v1beta1.FlinkClusterStatus{Revision: v1beta1.RevisionStatus{NextRevision: "cluster-85dc8f749-2"}},
+@@ -380,7 +273,9 @@ func TestGetUpdateState(t *testing.T) {
+ 				JobManager: v1beta1.JobManagerSpec{Ingress: &v1beta1.JobManagerIngressSpec{}},
+ 				Job:        &v1beta1.JobSpec{},
+ 			},
+-			Status: v1beta1.FlinkClusterStatus{Revision: v1beta1.RevisionStatus{CurrentRevision: "cluster-85dc8f749-2", NextRevision: "cluster-aa5e3a87z-3"}},
++			Status: v1beta1.FlinkClusterStatus{
++				Revision: v1beta1.RevisionStatus{CurrentRevision: "cluster-85dc8f749-2", NextRevision: "cluster-aa5e3a87z-3"},
++			},
+ 		},
+ 		jmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-aa5e3a87z"}}},
+ 		tmStatefulSet: &appsv1.StatefulSet{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{RevisionNameLabel: "cluster-85dc8f749"}}},
+-- 
+1.8.3.1
+
